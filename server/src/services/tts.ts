@@ -161,7 +161,7 @@ export class TtsService {
 
     const request = config.protocol === 'openai'
       ? this.openAiRequest({ text, voice, speed, ...(input.format ? { format: input.format } : {}) })
-      : { url: this.buildUrl({ text, voice, speed, ...(input.format ? { format: input.format } : {}) }), init: { method: 'GET' } as RequestInit };
+      : { url: this.buildUrl({ text, voice, speed, ...(input.format ? { format: input.format } : {}) }), init: { method: 'GET' } as RequestInit, contentType: '' };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), config.timeoutMs);
     let bytes: Uint8Array, contentType: string;
@@ -176,7 +176,7 @@ export class TtsService {
       contentType = (response.headers.get('content-type') ?? '').split(';')[0]!.trim();
       // Some OpenAI-compatible services answer audio as `application/octet-stream`;
       // the format was asked for explicitly, so its type is known.
-      if (config.protocol === 'openai' && contentType === 'application/octet-stream') contentType = request.contentType ?? 'audio/mpeg';
+      if (config.protocol === 'openai' && contentType === 'application/octet-stream') contentType = request.contentType || 'audio/mpeg';
       if (!contentType.startsWith('audio/')) throw badRequest('HTTP TTS service returned non-audio content', 'TTS_CONTENT');
       bytes = new Uint8Array(await response.arrayBuffer());
       if (!bytes.length) throw badRequest('HTTP TTS service returned empty audio', 'TTS_EMPTY');
