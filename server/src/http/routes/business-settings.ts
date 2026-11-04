@@ -6,6 +6,7 @@ import {SETTINGS_SCHEMA,type SettingsGroup} from '../../services/business-settin
 import {TtsService} from '../../services/tts.ts';
 import {MetadataHttp,TmdbProvider,MusicBrainzProvider} from '../../media/metadata-providers.ts';
 import {uploadBackup} from '../../maintenance/webdav.ts';
+import {OidcService} from '../../services/oidc.ts';
 
 export function registerBusinessSettingsRoutes(app:FastifyInstance,ctx:AppContext){
   const settings=ctx.settings!,auth=authenticate(ctx),active=new Set<string>();
@@ -45,6 +46,10 @@ export function registerBusinessSettingsRoutes(app:FastifyInstance,ctx:AppContex
         const service=new TtsService(ctx.config,settings.candidate('tts',input));
         const audio=await service.synthesize({text:'这是阅读器的朗读连接测试。'});
         return {ok:true,elapsedMs:Date.now()-started,bytes:audio.bytes.length,voices:await service.voices()};
+      }else if(name==='oidc'){
+        const value=settings.candidate('oidc',input),doc=await new OidcService(ctx).discover(value,true);
+        const redirect=ctx.config.publicUrl?ctx.config.publicUrl.replace(/\/+$/,'')+'/api/v1/auth/oidc/callback':'';
+        return {ok:true,elapsedMs:Date.now()-started,issuer:doc.issuer,redirectUri:redirect};
       }else if(name==='webdav'){
         const value=settings.candidate('webdav',input);
         if(!value.url||!value.username||!value.password)throw badRequest('请填写备份地址、账号和密码');

@@ -13,6 +13,7 @@ export interface BusinessValues {
   access:{publicUrl:string;corsOrigins:string;accessTokenTtl:number;refreshTokenTtl:number};
   webdav:{url:string;username:string;password:string;maxBytes:number};
   library:{memberUpload:boolean};
+  oidc:{enabled:boolean;buttonLabel:string;issuer:string;clientId:string;clientSecret:string;scopes:string;usernameClaim:string;userMap:string;autoCreate:boolean;adminGroup:string;passwordLogin:boolean};
 }
 export type SettingsGroup=keyof BusinessValues;
 type Field={key:string;label:string;type:'text'|'textarea'|'password'|'number'|'checkbox'|'url'|'select';default:string|number|boolean;min?:number;max?:number;help?:string;options?:Array<{value:string;label:string}>};
@@ -76,6 +77,19 @@ export const SETTINGS_SCHEMA:Record<SettingsGroup,{label:string;fields:Field[]}>
     {key:'password',label:'密码',type:'password',default:''},
     {key:'maxBytes',label:'单次上传上限（字节）',type:'number',default:2147483648,min:1,max:4294967295},
   ]},
+  oidc:{label:'OIDC 单点登录',fields:[
+    {key:'enabled',label:'启用 OIDC 登录',type:'checkbox',default:false,help:'回调地址：<对外服务地址>/api/v1/auth/oidc/callback（须先在「登录与服务访问」填写对外服务地址）'},
+    {key:'buttonLabel',label:'登录按钮文字',type:'text',default:'使用统一认证登录'},
+    {key:'issuer',label:'Issuer 地址',type:'url',default:'',help:'例如 https://auth.example.com/application/o/reader/ ，服务器会读取其 /.well-known/openid-configuration'},
+    {key:'clientId',label:'Client ID',type:'text',default:''},
+    {key:'clientSecret',label:'Client Secret',type:'password',default:''},
+    {key:'scopes',label:'Scopes',type:'text',default:'openid profile email'},
+    {key:'usernameClaim',label:'用户名声明',type:'text',default:'preferred_username',help:'用于对应本地账号和自动创建账号的声明，常用 preferred_username 或 email'},
+    {key:'userMap',label:'账号对应关系',type:'textarea',default:'',help:'每行一条：OIDC用户名=本地用户名。首次登录时按此关联已有账号，关联后以 OIDC 的 sub 为准'},
+    {key:'autoCreate',label:'自动创建账号',type:'checkbox',default:false,help:'没有对应关系的 OIDC 用户首次登录时创建成员账号；关闭时只允许已对应的账号登录'},
+    {key:'adminGroup',label:'管理员组（可选）',type:'text',default:'',help:'groups 声明包含此组的用户登录时提升为管理员（不会自动降级）'},
+    {key:'passwordLogin',label:'保留密码登录',type:'checkbox',default:true,help:'关闭后登录页只显示 OIDC 按钮；接口仍接受密码登录以便应急'},
+  ]},
   library:{label:'书库',fields:[
     {key:'memberUpload',label:'允许成员上传书籍',type:'checkbox',default:true,help:'成员只能新增支持格式的书籍文件：不解包压缩包、不覆盖已有文件。改名、移动、删除和新建目录始终仅限管理员'},
   ]},
@@ -131,6 +145,7 @@ export class BusinessSettings extends BusinessSettingsReader {
       if(!/^[a-z]{2,3}(?:-[a-zA-Z]{2,4})?$/.test(String(values.language)))throw badRequest('无效的资料语言');
     }
     if(group==='musicbrainz'&&values.enabled&&!/\S+\/\S+.*(?:@|https?:\/\/)/.test(String(values.userAgent)))throw badRequest('请填写应用名称/版本及有效联系地址');
+    if(group==='oidc'&&values.enabled&&(!values.issuer||!values.clientId))throw badRequest('启用 OIDC 前请填写 Issuer 地址和 Client ID');
     if(group==='tts'&&values.enabled&&!values.url)throw badRequest('启用 HTTP 朗读前请填写接口地址');
     if(group==='ai'&&values.enabled&&(!values.baseUrl||!values.apiKey||!values.model))throw badRequest('启用 AI 前请填写 Base URL、API Key 和模型');
     if(group==='access'){

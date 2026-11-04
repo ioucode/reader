@@ -68,6 +68,17 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id);
 
+-- OIDC identities: (issuer, sub) -> local account. Added for single sign-on;
+-- an older build simply ignores the table.
+CREATE TABLE IF NOT EXISTS oidc_identities (
+  issuer     TEXT NOT NULL,
+  subject    TEXT NOT NULL,
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (issuer, subject)
+);
+CREATE INDEX IF NOT EXISTS idx_oidc_user ON oidc_identities(user_id);
+
 -- The stable book identity. NEVER key books by path: a rename or a move of the
 -- file would otherwise wipe the reader's progress and highlights, which is the
 -- single most common complaint about self-hosted libraries.

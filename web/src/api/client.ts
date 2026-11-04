@@ -240,6 +240,13 @@ export class ReaderApi {
     return session;
   }
 
+  /** Trades the one-time code from the OIDC callback for an ordinary session. */
+  async oidcExchange(code: string): Promise<Session> {
+    const session = await this.call<Session>('/api/v1/auth/oidc/exchange', 'POST', { code });
+    await this.setSession(session);
+    return session;
+  }
+
   async me(): Promise<User> {
     const result = await this.get<{ user: User }>('/api/v1/auth/me');
     return result.user;

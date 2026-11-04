@@ -30,6 +30,8 @@ export interface InstanceInfo {
   apiVersion: number;
   registrationOpen: boolean;
   userCount: number;
+  /** OIDC single sign-on, when the server has it configured. */
+  oidc?: { enabled: boolean; label: string; passwordLogin: boolean };
 }
 
 export interface Book {

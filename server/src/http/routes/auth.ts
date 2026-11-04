@@ -2,7 +2,8 @@ import type { FastifyInstance } from 'fastify';
 import type { AppContext } from '../context.ts';
 import { authenticate, currentUser, requireAdmin } from '../auth.ts';
 import { RegistrationService } from '../../services/registration.ts';
-import { badRequest } from '../../lib/errors.ts';
+import { AppError, badRequest } from '../../lib/errors.ts';
+import { OidcService } from '../../services/oidc.ts';
 
 interface Credentials {
   username?: string;
@@ -14,6 +15,36 @@ interface Credentials {
 export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void {
   const authenticateFn = authenticate(ctx);
   const registration = new RegistrationService(ctx.db);
+  const oidc = new OidcService(ctx);
+  /** Where the browser goes after the provider: the web client's root, with a hash query. */
+  const landing = (params: Record<string, string>) => {
+    const base = ctx.config.publicUrl.replace(/\/+$/, '') || '';
+    return `${base}/#/?${new URLSearchParams(params).toString()}`;
+  };
+  const failure = (error: unknown) => error instanceof AppError ? error.message : '统一认证登录失败，请重试';
+
+  // ---- OIDC single sign-on (see services/oidc.ts) ----
+  app.get('/api/v1/auth/oidc/start', async (_request, reply) => {
+    reply.header('cache-control', 'no-store');
+    try {
+      return reply.redirect(await oidc.start(), 302);
+    } catch (error) {
+      return reply.redirect(landing({ oidc_error: failure(error) }), 302);
+    }
+  });
+  app.get('/api/v1/auth/oidc/callback', async (request, reply) => {
+    reply.header('cache-control', 'no-store');
+    try {
+      const code = await oidc.callback(request.query as Record<string, string>);
+      return reply.redirect(landing({ oidc_code: code }), 302);
+    } catch (error) {
+      app.log.warn({ code: error instanceof AppError ? error.code : 'OIDC_ERROR' }, 'oidc sign-in failed');
+      return reply.redirect(landing({ oidc_error: failure(error) }), 302);
+    }
+  });
+  app.post('/api/v1/auth/oidc/exchange', async (request) => {
+    return oidc.exchange((request.body as { code?: unknown } | undefined)?.code, request.headers['user-agent'] ?? '');
+  });
 
   app.get('/api/v1/admin/registration', {preHandler:authenticateFn}, async request => {
     requireAdmin(request); return {mode:registration.mode(),invites:registration.invites()};
@@ -94,6 +125,7 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
       registrationMode: ctx.users.count() === 0 ? 'open' : registration.mode(),
       invitationRequired: ctx.users.count() > 0 && registration.mode() === 'invite',
       userCount: ctx.users.count(),
+      oidc: oidc.publicInfo(),
     };
   });
 }

@@ -145,7 +145,17 @@ export class UserService {
       : await verifyPassword(password, 'scrypt$16384$8$1$AAAAAAAAAAAAAAAAAAAAAA==$AAAA');
     if (!row || !ok) throw unauthorized('invalid username or password', 'BAD_CREDENTIALS');
     if (row.disabled === 1) throw forbidden('account disabled', 'ACCOUNT_DISABLED');
+    return this.issueSession(row, device);
+  }
 
+  /** A fresh access/refresh pair for an already-authenticated account (password or OIDC). */
+  issueSession(row: UserRow, device = ''): {
+    user: PublicUser;
+    accessToken: string;
+    accessTokenExpiresAt: number;
+    refreshToken: string;
+    refreshTokenExpiresAt: number;
+  } {
     const access = signAccessToken(this.config, { id: row.id, role: row.role, authVersion: row.auth_version ?? 0 });
     const refresh = newRefreshToken();
     const refreshExpiresAt = Date.now() + this.config.refreshTokenTtl * 1000;

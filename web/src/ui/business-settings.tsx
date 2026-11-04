@@ -51,8 +51,8 @@ export function BusinessSettings({api,group,onSaved,selectControl}:{api:Settings
         {selected==='ai'&&<datalist id="ai-models">{models.map(model=><option key={model} value={model}/>)}</datalist>}
         <div className="user-manager-actions"><button className="button primary" disabled={busy}>保存配置</button>
           {selected==='ai'&&api.businessAiModels&&<button type="button" className="button" disabled={busy} onClick={()=>void work(async()=>{const result=await api.businessAiModels!({baseUrl:String(values.baseUrl||''),apiKey:String(values.apiKey||'')});setModels(result);setMessage(`已获取 ${result.length} 个模型`);})}>获取模型</button>}
-          {['tmdb','musicbrainz','tts','webdav'].includes(selected)&&<button type="button" className="button" disabled={busy} onClick={()=>void work(async()=>{
-            const result=await api.businessSettingsRequest<{elapsedMs:number;voices?:Array<{id:string;name:string}>}>(selected+'/test','POST',{values});setVoices(result.voices||[]);setMessage(`连接成功，耗时 ${result.elapsedMs} 毫秒${selected==='tts'?`，获取到 ${result.voices?.length??0} 个音色`:''}（尚未保存表单）`);
+          {['tmdb','musicbrainz','tts','webdav','oidc'].includes(selected)&&<button type="button" className="button" disabled={busy} onClick={()=>void work(async()=>{
+            const result=await api.businessSettingsRequest<{elapsedMs:number;voices?:Array<{id:string;name:string}>;redirectUri?:string}>(selected+'/test','POST',{values});setVoices(result.voices||[]);setMessage(`连接成功，耗时 ${result.elapsedMs} 毫秒${selected==='tts'?`，获取到 ${result.voices?.length??0} 个音色`:''}${selected==='oidc'?`；回调地址：${result.redirectUri||'（请先填写对外服务地址）'}`:''}（尚未保存表单）`);
           })}>{selected==='tts'?'检测连接并获取音色':'测试连接'}</button>}
           <button type="button" className="button" disabled={busy} onClick={()=>setRetry(value=>value+1)}>重新加载</button>
         </div>
