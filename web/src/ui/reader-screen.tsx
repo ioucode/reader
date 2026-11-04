@@ -161,6 +161,8 @@ export class ReaderScreen {
   /** What the server said it can synthesise. */
   private httpTtsAvailable = false;
   private httpTtsTimeoutMs=20000;
+  /** The server's voice list for the HTTP engine; the engine itself reports none. */
+  private httpVoices: Array<{ id: string; name: string; lang: string; default: boolean }> = [];
   /** Probed once per screen; a server's capabilities do not change mid-book. */
   /** Voices the current engine reports, for the panel's select. */
   private voices: Array<{ id: string; name: string; lang: string; default: boolean }> = [];
@@ -308,7 +310,7 @@ export class ReaderScreen {
             },
             onTheme: (patch) => { try { saveThemePreference(this.themeScope(), patch); } catch { /* the device refused storage; the choice simply does not stick */ } this.patch({}); },
             onSpeechSetting: (patch) => this.updateSpeechSetting(patch),
-            onVoice: (voice) => this.updateSpeechSetting({ ttsVoice: voice }),
+            onVoice: (voice) => this.updateSpeechSetting(this.effectiveEngineKind() === 'http' ? { ttsHttpVoice: voice } : { ttsVoice: voice }),
             onSpeakFromHere: () => void this.speakFromReaderPosition(),
             onSwitchEngine: (kind) => this.switchSpeechEngine(kind),
             onTocEntry: (ref) => void this.goToChapterRef(ref),
@@ -735,7 +737,7 @@ export class ReaderScreen {
     const kind = requested === 'auto' ? available.preferred : requested;
     if (!kind) throw new Error('当前设备没有可用语音，请配置系统语音或 HTTP 服务');
     if (kind === 'http') {
-      try { await this.options.api.testSpeech(this.settings.ttsVoice, this.settings.ttsRate, { signal: run.signal }); }
+      try { await this.options.api.testSpeech(this.voiceFor(kind), this.settings.ttsRate, { signal: run.signal }); }
       catch (error) {
         const labels: Record<string, string> = { TTS_DISABLED: '服务端未配置 HTTP 朗读', TTS_AUTH: '朗读上游鉴权失败，请检查服务端凭据', TTS_TIMEOUT: '朗读上游超时，请重试', TTS_EMPTY: '上游返回空音频', TTS_CONTENT: '上游返回的不是音频，请检查服务地址', TTS_UPSTREAM: '无法访问朗读上游服务' };
         if (error instanceof ApiError) throw new Error(labels[error.code] ?? error.message);
@@ -752,7 +754,7 @@ export class ReaderScreen {
     if (!engine) throw new Error('所选语音引擎不可用，请切换引擎');
     this.preview = engine;
     engine.setRate(this.settings.ttsRate); engine.setPitch(this.settings.ttsPitch);
-    engine.setVolume(this.settings.ttsVolume); engine.setVoice(this.settings.ttsVoice);
+    engine.setVolume(this.settings.ttsVolume); engine.setVoice(this.voiceFor(kind));
     engine.loadQueue = async from => ({ chunks: from ? [] : [{ text: '这是阅读器朗读试听。愿你享受阅读的时光。', node: null, start: 0, blockIndex: 0 }], startIndex: 0 });
     await engine.play(0);
     if (failure) throw new Error(failure);
@@ -1541,9 +1543,13 @@ export class ReaderScreen {
     try {
       const capabilities = await this.options.api.ttsCapabilities();
       this.httpTtsAvailable = capabilities?.http === true;
+      this.httpVoices = this.httpTtsAvailable
+        ? (capabilities?.voices ?? []).map(voice => ({ id: voice.id, name: voice.name, lang: voice.lang ?? '', default: false }))
+        : [];
       this.httpTtsTimeoutMs=(capabilities?.timeoutMs??20000)+5000;
     } catch {
       this.httpTtsAvailable = false;
+      this.httpVoices = [];
     }
     // Re-rendered either way: the answer decides whether the engine picker
     // appears at all, and a panel built before the probe would be missing the row
@@ -1944,7 +1950,7 @@ export class ReaderScreen {
     engine.setRate(this.settings.ttsRate);
     engine.setPitch(this.settings.ttsPitch);
     engine.setVolume(this.settings.ttsVolume);
-    engine.setVoice(this.settings.ttsVoice);
+    engine.setVoice(this.voiceFor(engine.kind));
     this.tts = engine;
     return engine;
   }
@@ -2105,7 +2111,16 @@ export class ReaderScreen {
     if (patch.ttsRate !== undefined) engine.setRate(patch.ttsRate);
     if (patch.ttsPitch !== undefined) engine.setPitch(patch.ttsPitch);
     if (patch.ttsVolume !== undefined) engine.setVolume(patch.ttsVolume);
-    if (patch.ttsVoice !== undefined) engine.setVoice(patch.ttsVoice);
+    if (patch.ttsVoice !== undefined && engine.kind !== 'http') engine.setVoice(patch.ttsVoice);
+    if (patch.ttsHttpVoice !== undefined && engine.kind === 'http') engine.setVoice(patch.ttsHttpVoice);
+  }
+
+  /**
+   * The voice for an engine. The HTTP engine keeps its own: a system voice id
+   * means nothing to a remote service, and sending one made it fail or fall back.
+   */
+  private voiceFor(kind: Exclude<SpeechEngineKind, 'auto'>): string {
+    return kind === 'http' ? this.settings.ttsHttpVoice : this.settings.ttsVoice;
   }
 
   /**
@@ -2238,6 +2253,7 @@ export class ReaderScreen {
         availability: this.speechAvailability(),
         engine: this.effectiveEngineKind(),
         voices: this.voices,
+        httpVoices: this.httpVoices,
       }),
     };
     this.renderChrome();
@@ -2282,6 +2298,7 @@ function emptyChromeSettings(): Partial<ChromeState> {
       ttsPitch: 1,
       ttsVolume: 1,
       ttsVoice: '',
+      ttsHttpVoice: '',
       ttsAutoAdvance: true,
       ttsEngine: 'auto',
       shelfDensity: 'cozy',
@@ -2317,6 +2334,7 @@ function settingsView(
     availability: ReturnType<typeof speechAvailability>;
     engine: Exclude<SpeechEngineKind, 'auto'> | null;
     voices: Array<{ id: string; name: string; lang: string; default: boolean }>;
+    httpVoices?: Array<{ id: string; name: string; lang: string; default: boolean }>;
   },
 ): Partial<ChromeState> {
   const fixedLayout = context.layout === 'fixed';
@@ -2330,6 +2348,7 @@ function settingsView(
   // paragraphs and no way to adjust them.
   const isTxt = context.format === 'txt' || context.plainText === true;
   const activeEngine = context.engine ?? context.availability.preferred;
+  const httpVoices = context.httpVoices ?? [];
   return {
     mode: settings.mode,
     readoutTopLeft: settings.readoutTopLeft,
@@ -2356,7 +2375,7 @@ function settingsView(
     ttsRate: settings.ttsRate,
     ttsPitch: settings.ttsPitch,
     ttsVolume: settings.ttsVolume,
-    ttsVoice: settings.ttsVoice,
+    ttsVoice: activeEngine === 'http' ? settings.ttsHttpVoice : settings.ttsVoice,
     ttsAutoAdvance: settings.ttsAutoAdvance,
     ttsEngine: settings.ttsEngine,
     showFitRow: fixedLayout,
@@ -2367,12 +2386,18 @@ function settingsView(
     showEngineRow:
       [context.availability.system, context.availability.native, context.availability.http].filter(Boolean).length > 1,
     showPitchRow: activeEngine !== 'http',
-    showVoiceRow: activeEngine !== 'http',
+    // The HTTP engine gets the row too once the server publishes voices.
+    showVoiceRow: activeEngine !== 'http' || httpVoices.length > 0,
     speechUnavailable: !context.availability.preferred,
-    voices: [{ value: '', label: '跟随系统' }, ...context.voices.map((voice) => ({
-      value: voice.id,
-      label: `${voice.name} · ${voice.lang}${voice.default ? ' · 默认' : ''}`,
-    }))],
+    voices: activeEngine === 'http'
+      ? [{ value: '', label: '服务默认' }, ...httpVoices.map((voice) => ({
+        value: voice.id,
+        label: voice.lang ? `${voice.name} · ${voice.lang}` : voice.name,
+      }))]
+      : [{ value: '', label: '跟随系统' }, ...context.voices.map((voice) => ({
+        value: voice.id,
+        label: `${voice.name} · ${voice.lang}${voice.default ? ' · 默认' : ''}`,
+      }))],
   };
 }
 

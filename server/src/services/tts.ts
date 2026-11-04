@@ -31,8 +31,9 @@ import {settingsDefaults,type BusinessValues} from './business-settings.ts';
  *
  * It **proxies**, it does not synthesise. `TTS_URL` points at any service that
  * accepts the classic `?text=...&speed=...` shape — edge-tts, a local Piper
- * wrapper, a commercial API with a compatibility shim — and the bytes are
- * streamed straight back. Bundling a synthesizer would multiply the image size
+ * wrapper, a commercial API with a compatibility shim — or, with the `openai`
+ * protocol, at any OpenAI-compatible `POST /audio/speech` endpoint, and the
+ * bytes are streamed straight back. Bundling a synthesizer would multiply the image size
  * and the CPU budget of a NAS, which is exactly the trade the client side of
  * this project refuses to make.
  *
@@ -63,10 +64,15 @@ export interface TtsVoice {
   lang: string;
 }
 
+type TtsProtocol = 'query' | 'openai';
+
 interface TtsConfig {
+  protocol: TtsProtocol;
   url: string;
   token: string;
+  model: string;
   voicesUrl: string;
+  voiceList: TtsVoice[];
   timeoutMs: number;
   cacheDir: string;
   cacheMaxBytes: number;
@@ -92,9 +98,12 @@ export class TtsService {
     const url = input.url.trim().replace(/\/+$/, '');
     this.config = input.enabled&&url
       ? {
+          protocol: input.protocol === 'openai' ? 'openai' : 'query',
           url,
           token: input.token,
+          model: (input.model ?? '').trim(),
           voicesUrl: input.voicesUrl,
+          voiceList: parseVoiceList(input.voiceList ?? ''),
           timeoutMs: input.timeoutMs,
           cacheDir: join(config.dataDir, 'tts-cache'),
           cacheMaxBytes: input.cacheMaxBytes,
@@ -145,22 +154,29 @@ export class TtsService {
     const speed = input.speed === undefined ? 1 : clamp(input.speed, 0.25, 4);
     const voice = (input.voice ?? '').slice(0, 120);
 
-    const key = hashKey({ text, voice, speed, format: input.format ?? '', url: config.url,credential:hashKey({token:config.token}) });
+    const key = hashKey({ text, voice, speed, format: input.format ?? '', url: config.url,credential:hashKey({token:config.token}),
+      ...(config.protocol === 'openai' ? { protocol: config.protocol, model: config.model } : {}) });
     const cached = this.readCache(key);
     if (cached) return { ...cached, cached: true };
 
-    const target = this.buildUrl({ text, voice, speed, ...(input.format ? { format: input.format } : {}) });
+    const request = config.protocol === 'openai'
+      ? this.openAiRequest({ text, voice, speed, ...(input.format ? { format: input.format } : {}) })
+      : { url: this.buildUrl({ text, voice, speed, ...(input.format ? { format: input.format } : {}) }), init: { method: 'GET' } as RequestInit };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), config.timeoutMs);
     let bytes: Uint8Array, contentType: string;
     try {
-      const response = await fetch(target, {
-        method: 'GET', headers: { accept: 'audio/*', ...(config.token ? { authorization: 'Bearer ' + config.token } : {}) },
+      const response = await fetch(request.url, {
+        ...request.init,
+        headers: { accept: 'audio/*', ...(request.init.headers as Record<string, string> | undefined), ...(config.token ? { authorization: 'Bearer ' + config.token } : {}) },
         signal: controller.signal,
       });
       if (!response.ok) throw badRequest('HTTP TTS service answered ' + response.status,
         response.status === 401 || response.status === 403 ? 'TTS_AUTH' : 'TTS_UPSTREAM');
       contentType = (response.headers.get('content-type') ?? '').split(';')[0]!.trim();
+      // Some OpenAI-compatible services answer audio as `application/octet-stream`;
+      // the format was asked for explicitly, so its type is known.
+      if (config.protocol === 'openai' && contentType === 'application/octet-stream') contentType = request.contentType ?? 'audio/mpeg';
       if (!contentType.startsWith('audio/')) throw badRequest('HTTP TTS service returned non-audio content', 'TTS_CONTENT');
       bytes = new Uint8Array(await response.arrayBuffer());
       if (!bytes.length) throw badRequest('HTTP TTS service returned empty audio', 'TTS_EMPTY');
@@ -174,10 +190,19 @@ export class TtsService {
     return { bytes, contentType, cached: false };
   }
 
-  /** The upstream voice list, when the service publishes one. */
+  /**
+   * The upstream voice list, when the service publishes one.
+   *
+   * Order of preference: an explicit list endpoint, then the administrator's own
+   * list, then — for the query protocol — the edge-tts `/voices` convention, and
+   * for the OpenAI protocol the built-in voices, because OpenAI publishes no list
+   * endpoint at all and a picker with nothing in it is the bug this fixes.
+   */
   async voices(): Promise<TtsVoice[]> {
     const config = this.config;
     if (!config) return [];
+    if (!config.voicesUrl && config.voiceList.length) return config.voiceList;
+    if (!config.voicesUrl && config.protocol === 'openai') return OPENAI_VOICES.map(id => ({ id, name: id, lang: '' }));
     // `/voices` is the convention edge-tts and its clones use; anything else is
     // configured explicitly rather than guessed.
     const url = config.voicesUrl || `${config.url}/voices`;
@@ -192,9 +217,9 @@ export class TtsService {
         },
         signal: controller.signal,
       });
-      if (!response.ok) return [];
+      if (!response.ok) return config.voiceList;
       const body = (await response.json()) as unknown;
-      const rows = Array.isArray(body) ? body : ((body as { voices?: unknown[] }).voices ?? []);
+      const rows = Array.isArray(body) ? body : ((body as { voices?: unknown[]; data?: unknown[] }).voices ?? (body as { data?: unknown[] }).data ?? []);
       return rows
         .map((row) => normaliseVoice(row))
         .filter((voice): voice is TtsVoice => voice !== null)
@@ -202,7 +227,7 @@ export class TtsService {
     } catch {
       // A missing voice list is not an error: the client falls back to whatever
       // the reader typed or to the service's own default.
-      return [];
+      return config.voiceList;
     } finally {
       clearTimeout(timer);
     }
@@ -227,6 +252,32 @@ export class TtsService {
     // the separator is chosen rather than assumed.
     const separator = config.url.includes('?') ? '&' : '?';
     return `${config.url}${separator}${params.toString()}`;
+  }
+
+  /**
+   * An OpenAI `POST /audio/speech` request.
+   *
+   * The configured URL may be the API base (`…/v1`) or the full endpoint; both
+   * are what people paste. The client's `format` is a MIME type, mapped onto
+   * OpenAI's `response_format` names.
+   */
+  private openAiRequest(input: { text: string; voice: string; speed: number; format?: string }): { url: string; init: RequestInit; contentType: string } {
+    const config = this.config!;
+    const url = /\/audio\/speech$/.test(config.url) ? config.url : `${config.url}/audio/speech`;
+    const wanted = input.format ?? '';
+    const format = OPENAI_FORMATS[wanted] ?? Object.values(OPENAI_FORMATS).find(f => f.name === wanted) ?? OPENAI_FORMATS['audio/mpeg']!;
+    const body = {
+      model: config.model || 'tts-1',
+      input: input.text,
+      voice: input.voice || 'alloy',
+      response_format: format.name,
+      speed: input.speed,
+    };
+    return {
+      url,
+      init: { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) },
+      contentType: format.mime,
+    };
   }
 
   // ---- cache ----
@@ -314,11 +365,34 @@ export class TtsService {
   }
 }
 
+/** OpenAI's built-in voices; the API has no endpoint that lists them. */
+const OPENAI_VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'nova', 'onyx', 'sage', 'shimmer', 'verse'];
+
+const OPENAI_FORMATS: Record<string, { name: string; mime: string }> = {
+  'audio/mpeg': { name: 'mp3', mime: 'audio/mpeg' },
+  'audio/wav': { name: 'wav', mime: 'audio/wav' },
+  'audio/ogg': { name: 'opus', mime: 'audio/ogg' },
+  'audio/mp4': { name: 'aac', mime: 'audio/aac' },
+};
+
+/** `id` or `id|名称`, one per line; blank lines and duplicates are dropped. */
+function parseVoiceList(text: string): TtsVoice[] {
+  const seen = new Set<string>(), voices: TtsVoice[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const [rawId, ...rest] = line.split('|');
+    const id = (rawId ?? '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    voices.push({ id: id.slice(0, 120), name: rest.join('|').trim() || id, lang: '' });
+  }
+  return voices.slice(0, 400);
+}
+
 function normaliseVoice(row: unknown): TtsVoice | null {
   if (typeof row === 'string') return { id: row, name: row, lang: '' };
   if (typeof row !== 'object' || row === null) return null;
   const record = row as Record<string, unknown>;
-  const id = String(record['id'] ?? record['ShortName'] ?? record['name'] ?? '');
+  const id = String(record['id'] ?? record['voice_id'] ?? record['ShortName'] ?? record['name'] ?? '');
   if (!id) return null;
   return {
     id,

@@ -73,6 +73,8 @@ export interface AppSettings extends ViewSettings {
   ttsPitch: number;
   ttsVolume: number;
   ttsVoice: string;
+  /** The HTTP engine's voice, kept apart: a system voice id means nothing to a remote service. */
+  ttsHttpVoice: string;
   /** Keep reading into the next chapter when the current one runs out. */
   ttsAutoAdvance: boolean;
   /**
@@ -133,6 +135,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   ttsPitch: 1,
   ttsVolume: 1,
   ttsVoice: '',
+  ttsHttpVoice: '',
   ttsAutoAdvance: true,
   ttsEngine: 'auto',
   shelfDensity: 'cozy',

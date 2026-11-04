@@ -7,7 +7,7 @@ export interface BusinessValues {
   playback:{mode:'auto'|'direct'|'proxy'};
   tmdb:{enabled:boolean;token:string;apiKey:string;language:string};
   musicbrainz:{enabled:boolean;userAgent:string};
-  tts:{enabled:boolean;url:string;token:string;voicesUrl:string;timeoutMs:number;cacheMaxBytes:number};
+  tts:{enabled:boolean;protocol:'query'|'openai';url:string;token:string;model:string;voicesUrl:string;voiceList:string;timeoutMs:number;cacheMaxBytes:number};
   scanning:{interval:number;libraries:number;files:number;mediaAutoScan:boolean;mediaScrape:boolean;mediaEmbedded:boolean;mediaHidden:boolean};
   scraping:{timeoutMs:number;retries:number};
   access:{publicUrl:string;corsOrigins:string;accessTokenTtl:number;refreshTokenTtl:number};
@@ -42,9 +42,12 @@ export const SETTINGS_SCHEMA:Record<SettingsGroup,{label:string;fields:Field[]}>
   ]},
   tts:{label:'HTTP 朗读',fields:[
     {key:'enabled',label:'启用 HTTP 朗读',type:'checkbox',default:false},
-    {key:'url',label:'语音合成接口',type:'url',default:'',help:'兼容 text、voice、speed 查询参数；地址须能从服务器访问'},
+    {key:'protocol',label:'接口协议',type:'select',default:'query',options:[{value:'query',label:'查询参数（GET ?text=&voice=&speed=）'},{value:'openai',label:'OpenAI 兼容（POST /audio/speech）'}],help:'OpenAI 兼容：填 Base URL（如 https://api.openai.com/v1）或完整的 …/audio/speech 地址'},
+    {key:'url',label:'语音合成接口',type:'url',default:'',help:'查询参数协议：兼容 text、voice、speed 查询参数；地址须能从服务器访问'},
     {key:'token',label:'认证令牌',type:'password',default:''},
-    {key:'voicesUrl',label:'音色列表接口（可选）',type:'url',default:''},
+    {key:'model',label:'模型（OpenAI 兼容）',type:'text',default:'',help:'例如 tts-1、gpt-4o-mini-tts；留空时使用 tts-1'},
+    {key:'voicesUrl',label:'音色列表接口（可选）',type:'url',default:'',help:'返回 JSON 数组或 {voices:[…]}，每项含 id、name、lang'},
+    {key:'voiceList',label:'音色列表（可选）',type:'textarea',default:'',help:'每行一个：音色ID 或 音色ID|显示名称。未配置列表接口时使用；OpenAI 兼容协议都未配置时提供 OpenAI 内置音色'},
     {key:'timeoutMs',label:'请求超时（毫秒）',type:'number',default:20000,min:100,max:120000},
     {key:'cacheMaxBytes',label:'音频缓存上限（字节，0 关闭）',type:'number',default:268435456,min:0,max:10737418240},
   ]},
@@ -165,7 +168,7 @@ function legacySettings<K extends SettingsGroup>(group:K,config:AppConfig):Busin
     ai:{enabled:false,scanEnabled:false,summaryEnabled:false,baseUrl:text('AI_BASE_URL'),apiKey:text('AI_API_KEY'),model:text('AI_MODEL'),scanPrompt:'请根据以下媒体路径识别类型。必须返回 JSON 数组，每项包含 path、category（movie/series/music/audiobook/other）、title、year、season、artist、album。不要添加解释。',summaryPrompt:'请用中文总结以下章节内容，提炼主要情节、人物和关键信息，输出简洁连贯的段落。',batchSize:500,maxInputChars:60000},
     tmdb:{enabled:!!(text('MEDIA_TMDB_TOKEN')||text('MEDIA_TMDB_API_KEY')),token:text('MEDIA_TMDB_TOKEN'),apiKey:text('MEDIA_TMDB_API_KEY'),language:'zh-CN'},
     musicbrainz:{enabled:!!text('MEDIA_MUSICBRAINZ_USER_AGENT'),userAgent:text('MEDIA_MUSICBRAINZ_USER_AGENT')},
-    tts:{enabled:!!text('TTS_URL'),url:text('TTS_URL'),token:text('TTS_TOKEN'),voicesUrl:text('TTS_VOICES_URL'),timeoutMs:integer('TTS_TIMEOUT_MS',20000),cacheMaxBytes:integer('TTS_CACHE_BYTES',268435456)},
+    tts:{enabled:!!text('TTS_URL'),protocol:text('TTS_PROTOCOL')==='openai'?'openai':'query',url:text('TTS_URL'),token:text('TTS_TOKEN'),model:text('TTS_MODEL'),voicesUrl:text('TTS_VOICES_URL'),voiceList:text('TTS_VOICES'),timeoutMs:integer('TTS_TIMEOUT_MS',20000),cacheMaxBytes:integer('TTS_CACHE_BYTES',268435456)},
     scanning:{interval:intervals.length?Math.min(...intervals):0,libraries:2,files:4,mediaAutoScan:true,mediaScrape:false,mediaEmbedded:true,mediaHidden:false},
     access:{publicUrl:config.publicUrl,corsOrigins:config.corsOrigins.join(','),accessTokenTtl:config.accessTokenTtl,refreshTokenTtl:config.refreshTokenTtl},
     webdav:{url:text('WEBDAV_URL'),username:text('WEBDAV_USERNAME'),password:text('WEBDAV_PASSWORD'),maxBytes:integer('WEBDAV_MAX_BYTES',2147483648)},
