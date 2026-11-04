@@ -52,13 +52,16 @@ export function BusinessSettings({api,group,onSaved,selectControl}:{api:Settings
         <div className="user-manager-actions"><button className="button primary" disabled={busy}>保存配置</button>
           {selected==='ai'&&api.businessAiModels&&<button type="button" className="button" disabled={busy} onClick={()=>void work(async()=>{const result=await api.businessAiModels!({baseUrl:String(values.baseUrl||''),apiKey:String(values.apiKey||'')});setModels(result);setMessage(`已获取 ${result.length} 个模型`);})}>获取模型</button>}
           {['tmdb','musicbrainz','tts','webdav'].includes(selected)&&<button type="button" className="button" disabled={busy} onClick={()=>void work(async()=>{
-            const result=await api.businessSettingsRequest<{elapsedMs:number;voices?:Array<{id:string;name:string}>}>(selected+'/test','POST',{values});setVoices(result.voices||[]);setMessage(`连接成功，耗时 ${result.elapsedMs} 毫秒（尚未保存表单）`);
+            const result=await api.businessSettingsRequest<{elapsedMs:number;voices?:Array<{id:string;name:string}>}>(selected+'/test','POST',{values});setVoices(result.voices||[]);setMessage(`连接成功，耗时 ${result.elapsedMs} 毫秒${selected==='tts'?`，获取到 ${result.voices?.length??0} 个音色`:''}（尚未保存表单）`);
           })}>{selected==='tts'?'检测连接并获取音色':'测试连接'}</button>}
           <button type="button" className="button" disabled={busy} onClick={()=>setRetry(value=>value+1)}>重新加载</button>
         </div>
       </form>
       {selected==='ai'&&models.length>0&&<p className="muted">可用模型：{models.join('、')}</p>}
-      {selected==='tts'&&<div className="user-manager-form"><label>试听音色<input list="business-tts-voices" value={voice} onInput={event=>setVoice(event.currentTarget.value)}/><datalist id="business-tts-voices">{voices.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}</datalist></label>
+      {selected==='tts'&&<div className="user-manager-form"><label>试听音色{voices.length
+        // A real select once the list is known: datalist suggestions barely show on mobile browsers.
+        ?<select value={voice} onChange={event=>setVoice(event.currentTarget.value)}><option value="">服务默认</option>{voices.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}</select>
+        :<input value={voice} placeholder="先点「检测连接并获取音色」，或直接填音色 ID" onInput={event=>setVoice(event.currentTarget.value)}/>}</label>
         <button className="button" disabled={busy} onClick={()=>void work(async()=>{setAudio(URL.createObjectURL(await api.businessTtsPreview(values,voice)));setMessage('试听音频已就绪');})}>生成试听音频</button>
         {audio&&<audio controls src={audio} aria-label="HTTP 朗读试听"/>}
         <button className="button" disabled={busy} onClick={()=>setClear(true)}>清理音频缓存</button>
