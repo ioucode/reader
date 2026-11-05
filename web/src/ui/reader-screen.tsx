@@ -737,7 +737,7 @@ export class ReaderScreen {
     const kind = requested === 'auto' ? available.preferred : requested;
     if (!kind) throw new Error('当前设备没有可用语音，请配置系统语音或 HTTP 服务');
     if (kind === 'http') {
-      try { await this.options.api.testSpeech(this.voiceFor(kind), this.settings.ttsRate, { signal: run.signal }); }
+      try { await this.options.api.testSpeech(this.voiceFor(kind), 1, { signal: run.signal }); } // speed 1: the HTTP engine plays the 1× clip at playbackRate, so the probe warms the same cache entry
       catch (error) {
         const labels: Record<string, string> = { TTS_DISABLED: '服务端未配置 HTTP 朗读', TTS_AUTH: '朗读上游鉴权失败，请检查服务端凭据', TTS_TIMEOUT: '朗读上游超时，请重试', TTS_EMPTY: '上游返回空音频', TTS_CONTENT: '上游返回的不是音频，请检查服务地址', TTS_UPSTREAM: '无法访问朗读上游服务' };
         if (error instanceof ApiError) throw new Error(labels[error.code] ?? error.message);
