@@ -298,7 +298,9 @@ export class HttpTtsEngine {
     const url = this.buildUrl('/api/v1/tts', {
       text,
       ...(this.voiceId ? { voice: this.voiceId } : {}),
-      speed: String(this.rate),
+      // No `speed` here: the rate is applied once, by `playbackRate` below (and
+      // live by `setRate`). Asking the server for a sped-up clip as well played
+      // it at rate × rate — 1.5× came out at 2.25×.
     });
     if (!url) {
       this.fail('HTTP 朗读未配置');

@@ -183,6 +183,14 @@ describe('HttpTtsEngine', () => {
     expect(audios[0]!.playbackRate).toBe(1.5);
   });
 
+  it('applies the rate once — on the element, never also in the synthesis request', async () => {
+    const { engine, audios } = makeEngine({ chunks: [['一。', '二。']] });
+    engine.setRate(1.5);
+    await engine.play(0);
+    expect(audios[0]!.playbackRate).toBe(1.5);
+    expect(new URL(audios[0]!.src).searchParams.has('speed')).toBe(false);
+  });
+
   it('asks for the next chapter when the queue runs out, when the reader allowed it', async () => {
     const { engine, audios } = makeEngine({ chunks: [['一。'], ['二。']] });
     await engine.play(0);
