@@ -171,6 +171,18 @@ test('basic credentials stay scoped to the configured origin on allowed CDN redi
   assert.ok(network.calls.every((call) => call.redirect === 'manual'));
 });
 
+test('allowed origins also cover catalog pages served from a mirror host', async () => {
+  const network = transport({
+    [ROOT]: new Response(null, { status: 302, headers: { location: 'https://mirror.example/opds' } }),
+    'https://mirror.example/opds': jsonFeed(),
+  });
+  const provider = createOpdsProvider(network);
+  await assert.rejects(() => provider.browse!(context(), {}), code('OPDS_UNSAFE_URL'));
+  const page = await provider.browse!(context({ url: ROOT, allowedOrigins: ['https://mirror.example'] }), {});
+  assert.equal(page.items.length > 0, true);
+  await assert.rejects(() => provider.browse!(context({ url: ROOT, allowedOrigins: ['https://mirror.example'] }), { cursor: 'https://other.example/private' }), code('OPDS_UNSAFE_URL'));
+});
+
 test('forged origins and redirects are rejected before reaching an unrelated host', async () => {
   const network = transport({ [ROOT]: new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/private' } }) });
   const provider = createOpdsProvider(network);

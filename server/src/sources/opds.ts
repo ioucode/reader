@@ -202,7 +202,9 @@ function checkedUrl(candidate: string, config: OpdsConfig, file = false): string
   const normalized = url(candidate, config.url);
   if (!normalized) fail('OPDS link must use HTTP(S) without URL credentials', 'OPDS_UNSAFE_URL', 400);
   const target = new URL(normalized);
-  const allowed = [new URL(config.url).origin, ...(file ? config.allowedOrigins ?? [] : [])];
+  // Admin-listed origins cover both catalog pages (e.g. a catalog root that redirects to a mirror host)
+  // and downloads; anything else is still rejected before a request leaves the server.
+  const allowed = [new URL(config.url).origin, ...(config.allowedOrigins ?? [])];
   if (!allowed.includes(target.origin)) fail('OPDS link origin is not allowed by this source', 'OPDS_UNSAFE_URL', 400);
   return target.href;
 }
@@ -348,7 +350,7 @@ export function createOpdsProvider(options: OpdsProviderOptions = {}): SourcePro
         properties: {
           url: { type: 'string', format: 'uri', title: 'OPDS catalog URL' },
           username: { type: 'string', title: 'Basic authentication username (password is stored separately)' },
-          allowedOrigins: { type: 'array', items: { type: 'string', format: 'uri' }, title: 'Additional download origins' },
+          allowedOrigins: { type: 'array', items: { type: 'string', format: 'uri' }, title: 'Additional allowed origins (catalog pages and downloads)' },
         },
       },
     },
