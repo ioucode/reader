@@ -12,6 +12,7 @@ import { AppProviders } from './app/providers/AppProviders.tsx';
 import { createAppRuntime, inferDefaultUrl } from './app/runtime.ts';
 import { router } from './app/router/router.tsx';
 import { registerPwa } from './core/pwa.ts';
+import { pinViewport } from './core/viewport-pin.ts';
 
 /**
  * Entry point.
@@ -44,6 +45,7 @@ async function start(): Promise<void> {
   window.__readerFlush = () => runtime.flush();
   createRoot(appRoot).render(<AppProviders runtime={runtime}><RouterProvider router={router} /></AppProviders>);
   registerPwa();
+  pinViewport();
   document.getElementById('app-startup')?.remove();
 }
 

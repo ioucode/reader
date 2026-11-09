@@ -262,6 +262,9 @@ select {
   display: flex;
   flex-direction: column;
   height: 100%;
+  /* The *visible* viewport: on iOS Safari 100% can stay at the size from before the
+     toolbar collapsed/expanded, which pushes the bottom bar under Safari's toolbar. */
+  height: 100dvh;
   /*
    * The reader is an app, not a document: a rubber-band overscroll on Android
    * shows a white flash behind the paper colour, and a pull-to-refresh gesture
