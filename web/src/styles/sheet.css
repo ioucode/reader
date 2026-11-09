@@ -285,6 +285,7 @@
   .sheet:not([data-size='compact']) {
     height: min(80vh, calc(100vh - var(--safe-top) - 1.5rem));
     height: min(80dvh, calc(100dvh - var(--safe-top) - 1.5rem));
+    height: min(80dvh, calc(100dvh - var(--safe-top) - 1.5rem));
   }
 
   .sheet-footer .button {
@@ -299,6 +300,7 @@
 @media (max-width: 700px) {
   .sheet[data-host='pwa']:not([data-size='compact']) {
     inset: 20vh 0 0;
+    inset: 20dvh 0 0;
     height: auto;
     max-height: none;
     display: flex !important;

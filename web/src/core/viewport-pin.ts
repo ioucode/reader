@@ -11,8 +11,13 @@
  *
  * Whenever no text field is focused, undo any document scroll.
  */
+// Only a control you type into earns the document scroll Safari gives it (to lift it above the
+// keyboard). A focused checkbox, slider or button does not, or the shift would never be undone.
+const NON_TEXT = /^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/;
 const editable = (el: Element | null): boolean =>
-  !!el && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || (el as HTMLElement).isContentEditable);
+  !!el &&
+  (el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || (el as HTMLElement).isContentEditable ||
+    (el instanceof HTMLInputElement && !NON_TEXT.test(el.type)));
 
 export function pinViewport(): void {
   let frame = 0;
@@ -20,11 +25,16 @@ export function pinViewport(): void {
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(() => {
       if (editable(document.activeElement)) return;
+      // Pinch-zoomed: the user is panning around the page, do not yank it back to the corner.
+      if ((window.visualViewport?.scale ?? 1) > 1.01) return;
       if (window.scrollX !== 0 || window.scrollY !== 0) window.scrollTo(0, 0);
     });
   };
   // focusout fires before the keyboard animation ends; check again once it has.
-  document.addEventListener('focusout', () => { settle(); setTimeout(settle, 350); });
+  const settleTwice = (): void => { settle(); setTimeout(settle, 350); };
+  document.addEventListener('focusout', settleTwice);
+  // Back/forward restores the page from bfcache without re-running anything.
+  window.addEventListener('pageshow', settleTwice);
   window.addEventListener('scroll', settle, { passive: true });
   window.addEventListener('orientationchange', () => setTimeout(settle, 350));
   window.visualViewport?.addEventListener('resize', settle);
