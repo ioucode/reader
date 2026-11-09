@@ -25,8 +25,6 @@ export function pinViewport(): void {
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(() => {
       if (editable(document.activeElement)) return;
-      // Pinch-zoomed: the user is panning around the page, do not yank it back to the corner.
-      if ((window.visualViewport?.scale ?? 1) > 1.01) return;
       if (window.scrollX !== 0 || window.scrollY !== 0) window.scrollTo(0, 0);
     });
   };
