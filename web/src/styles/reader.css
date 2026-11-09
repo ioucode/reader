@@ -232,6 +232,9 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
+  /* Same visible-viewport height as #app: with 100% here and 100dvh there, a collapsed Safari
+     toolbar made #app taller than body and the document itself scrollable again. */
+  height: 100dvh;
 }
 
 body {
@@ -2802,7 +2805,7 @@ book-content {
   text-align: start;
 }
 
-.login-screen { display:flex; align-items:flex-start; min-height:100vh; box-sizing:border-box; overflow-y:auto; background:var(--reader-paper); padding:3.2rem 1.5rem 4rem; }
+.login-screen { display:flex; align-items:flex-start; min-height:100vh; min-height:100dvh; box-sizing:border-box; overflow-y:auto; background:var(--reader-paper); padding:3.2rem 1.5rem 4rem; }
 .login-card { max-width:35rem; width:100%; margin:0 auto; padding:0; border:0; border-radius:0; background:transparent; box-shadow:none; }
 .login-heading { margin-bottom:2.25rem; }
 .login-brand { font-size:2.35rem; line-height:1.15; font-weight:750; letter-spacing:-.035em; color:var(--reader-ink); }
@@ -3715,6 +3718,7 @@ svg.icon { display: inline-block; width: 1em; height: 1em; flex-shrink: 0; verti
 @media (max-width: 700px) {
   .reader-screen .sheet {
     height: min(62vh, calc(100vh - var(--safe-top) - 1.5rem));
+    height: min(62dvh, calc(100dvh - var(--safe-top) - 1.5rem));
     height: min(62dvh, calc(100dvh - var(--safe-top) - 1.5rem));
     max-height: 36rem;
   }
