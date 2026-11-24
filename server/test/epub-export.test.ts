@@ -1,24 +1,33 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import JSZip from 'jszip';
 import { AppError } from '../src/lib/errors.ts';
-import { EpubExportService, buildEpub, paragraphs, privateAddress, safeName } from '../src/services/epub-export.ts';
+import { EpubExportService, buildEpub, inside, paragraphs, privateAddress, safeName } from '../src/services/epub-export.ts';
 import type { SourceHost } from '../src/services/source-host.ts';
 
 describe('epub export helpers', () => {
-  test('safeName keeps Chinese titles and strips path characters', () => {
+  test('safeName keeps Chinese titles, strips path characters and caps UTF-8 bytes', () => {
     assert.equal(safeName('淫书生'), '淫书生');
     assert.equal(safeName('../a/b:c*?'), 'a b c');
     assert.equal(safeName('   '), '未命名');
-    assert.equal(safeName('x'.repeat(300)).length, 100);
+    assert.ok(Buffer.byteLength(safeName('书'.repeat(300))) <= 150);
+    assert.equal(safeName('书'.repeat(300), 30), '书'.repeat(10));
   });
 
-  test('paragraphs splits plain text and strips HTML safely', () => {
+  test('inside compares whole path components', () => {
+    assert.equal(inside('/books', '/books'), true);
+    assert.equal(inside('/books', '/books/a/..x'), true);
+    assert.equal(inside('/books', '/books-archive'), false);
+    assert.equal(inside('/books', '/data/epub-archive'), false);
+  });
+
+  test('paragraphs splits plain text, strips HTML and keeps a note for illustrations', () => {
     assert.deepEqual(paragraphs('　　第一段\n\n　　第二段', 'text/plain; charset=utf-8'), ['第一段', '第二段']);
     assert.deepEqual(paragraphs('<p>一 &amp; 二</p><script>alert(1)</script><p>三<br>四</p>', 'text/html'), ['一 & 二', '三', '四']);
+    assert.deepEqual(paragraphs('<p><img src="reader-res:a"></p>', 'text/html'), ['（此处有插图，未保存到 EPUB）']);
   });
 
   test('privateAddress rejects internal ranges', () => {
@@ -42,32 +51,40 @@ describe('epub export helpers', () => {
 describe('EpubExportService', () => {
   const host = (overrides: Partial<Record<string, unknown>> = {}) => ({
     chapterPublication: async () => ({ entry: { ref: 'e1', title: '测试书', authors: ['乙'] }, publicationRef: 'p1', sourceName: '某书源' }),
+    // Array order deliberately differs from reading order (seq).
     manifest: async () => ({ publicationRef: 'p1', items: [
-      { id: 'a', seq: 0, title: '一', kind: 'chapter', mediaType: 'text/plain', ref: 'r1' },
       { id: 'b', seq: 1, title: '二', kind: 'chapter', mediaType: 'text/plain', ref: 'r2' },
+      { id: 'a', seq: 0, title: '一', kind: 'chapter', mediaType: 'text/plain', ref: 'r1' },
     ] }),
     resource: async (_u: string, _s: string, _p: string, ref: string) => ({ mediaType: 'text/plain; charset=utf-8', text: `正文 ${ref}` }),
     ...overrides,
   }) as unknown as SourceHost;
-  const until = async (fn: () => boolean) => { for (let i = 0; i < 200 && !fn(); i++) await new Promise((r) => setTimeout(r, 10)); };
+  const until = async (fn: () => boolean) => { for (let i = 0; i < 300 && !fn(); i++) await new Promise((r) => setTimeout(r, 10)); };
+  const fixture = async () => {
+    const root = await mkdtemp(join(tmpdir(), 'epub-export-'));
+    await mkdir(join(root, 'books'));
+    return { root, dir: join(root, 'archive'), books: join(root, 'books') };
+  };
 
-  test('saves <source>/<title>.epub and reports progress', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'epub-export-'));
+  test('saves <source>/<title> [<ref>].epub in seq order and reports progress', async () => {
+    const { root, dir, books } = await fixture();
     try {
-      const service = new EpubExportService(host(), dir);
+      const service = new EpubExportService(host(), dir, books);
       const job = service.start('u1', 's1', 'e1');
       await until(() => job.state !== 'running');
       assert.equal(job.state, 'done', job.error);
       assert.equal(job.done, 2); assert.equal(job.total, 2);
-      assert.equal(job.file, '某书源/测试书.epub');
-      const zip = await JSZip.loadAsync(await readFile(join(dir, '某书源', '测试书.epub')));
+      assert.equal(job.file, '某书源/测试书 [e1].epub');
+      assert.deepEqual(await readdir(join(dir, '某书源')), ['测试书 [e1].epub']);
+      const zip = await JSZip.loadAsync(await readFile(join(dir, '某书源', '测试书 [e1].epub')));
+      assert.match(await zip.file('OEBPS/c00001.xhtml')!.async('string'), /<h2>一<\/h2><p>正文 r1<\/p>/);
       assert.match(await zip.file('OEBPS/c00002.xhtml')!.async('string'), /正文 r2/);
       assert.throws(() => service.get('u2', job.id), /导出任务不存在/);
-    } finally { await rm(dir, { recursive: true, force: true }); }
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
-  test('runs one export at a time and retries a busy source', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'epub-export-'));
+  test('runs one export at a time, per admin, and retries a busy source', async () => {
+    const { root, dir, books } = await fixture();
     try {
       let busy = 1;
       const service = new EpubExportService(host({
@@ -75,12 +92,38 @@ describe('EpubExportService', () => {
           if (busy-- > 0) throw new AppError(429, 'RATE_LIMITED', 'busy');
           return { mediaType: 'text/plain', text: ref };
         },
-      }), dir);
+      }), dir, books);
       const job = service.start('u1', 's1', 'e1');
       assert.equal(service.start('u1', 's1', 'e1'), job);
+      assert.throws(() => service.start('u2', 's1', 'e1'), /正在保存/);
       assert.throws(() => service.start('u1', 's1', 'other'), /正在保存/);
       await until(() => job.state !== 'running');
       assert.equal(job.state, 'done', job.error);
-    } finally { await rm(dir, { recursive: true, force: true }); }
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test('fails instead of saving an archive with an empty chapter', async () => {
+    const { root, dir, books } = await fixture();
+    try {
+      const service = new EpubExportService(host({
+        resource: async (_u: string, _s: string, _p: string, ref: string) => ({ mediaType: 'text/plain', text: ref === 'r2' ? '  \n ' : '正文' }),
+      }), dir, books);
+      const job = service.start('u1', 's1', 'e1');
+      await until(() => job.state !== 'running');
+      assert.equal(job.state, 'failed');
+      assert.match(job.error ?? '', /没有可读正文/);
+      await assert.rejects(readdir(join(dir, '某书源')));
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test('refuses an archive directory inside the library', async () => {
+    const { root, books } = await fixture();
+    try {
+      const service = new EpubExportService(host(), join(books, 'archive'), books);
+      const job = service.start('u1', 's1', 'e1');
+      await until(() => job.state !== 'running');
+      assert.equal(job.state, 'failed');
+      assert.match(job.error ?? '', /不能在书库目录里/);
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 });

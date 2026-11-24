@@ -9,8 +9,7 @@ import { searchResponse } from '../search-stream.ts';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { PluginInstaller, PLUGIN_UPLOAD_LIMIT } from '../../sources/plugin-installer.ts';
-import { relative } from 'node:path';
-import { EpubExportService, exportDir, type EpubExportJob } from '../../services/epub-export.ts';
+import { EpubExportService, exportDir, inside, type EpubExportJob } from '../../services/epub-export.ts';
 
 function textBody(body: unknown, name: string): string {
   const value = (body as Record<string, unknown> | null)?.[name];
@@ -46,9 +45,9 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
 
   // 「保存 EPUB」: archive a chapter source entry as an EPUB outside the library, never onto a shelf.
   const exportsDir = exportDir(ctx.config);
-  const exportsInsideLibrary = !relative(ctx.config.booksDir, exportsDir).startsWith('..');
+  const exportsInsideLibrary = inside(ctx.config.booksDir, exportsDir); // 实际写入前还会按真实路径再查一次
   if (exportsInsideLibrary) app.log.warn({ exportsDir }, 'EPUB_EXPORT_DIR is inside BOOKS_DIR; EPUB export disabled');
-  const epubExports = new EpubExportService(host, exportsDir, app.log);
+  const epubExports = new EpubExportService(host, exportsDir, ctx.config.booksDir, app.log);
   app.addHook('onClose', async () => { epubExports.close(); });
   const exportView = (job: EpubExportJob) => ({
     id: job.id, sourceId: job.sourceId, entryRef: job.entryRef, title: job.title, state: job.state,

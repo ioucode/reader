@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { lookup } from 'node:dns/promises';
-import { isIP } from 'node:net';
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { lookup } from 'node:dns';
+import { request as httpsRequest } from 'node:https';
+import { isIP, type LookupFunction } from 'node:net';
+import { mkdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import JSZip from 'jszip';
 import sanitize from 'sanitize-html';
 import type { FastifyBaseLogger } from 'fastify';
@@ -13,15 +14,17 @@ import type { SourceHost } from './source-host.ts';
 /**
  * 「保存 EPUB」: turns a chapter source entry into an EPUB file under
  * EPUB_EXPORT_DIR (default DATA_DIR/epub-archive), laid out as
- * `<source name>/<title>.epub`. Nothing is added to any shelf.
+ * `<source name>/<title> [<entry ref>].epub`. Nothing is added to any shelf.
  *
- * The directory is server-owned and deliberately outside BOOKS_DIR, so an
+ * The directory is server-owned and must resolve outside BOOKS_DIR, so an
  * archive never re-enters the library scan; mirroring it elsewhere (OneDrive
  * in the codearea deployment) is the deployment's job.
  *
- * Export is one job at a time and reads chapters sequentially through the
- * same SourceHost calls the reader uses, so it never hammers a site harder
- * than reading does. A busy source (429) is retried with backoff.
+ * Export is one job at a time and reads chapters sequentially (in manifest
+ * `seq` order) through the same SourceHost calls the reader uses, so it never
+ * hammers a site harder than reading does. A busy source (429) is retried with
+ * backoff. Anything that would make the archive silently incomplete — an empty
+ * chapter, a book too large to hold in memory — fails the job instead.
  */
 
 export type EpubExportState = 'running' | 'done' | 'failed';
@@ -42,8 +45,13 @@ export interface EpubExportJob {
 
 const MAX_CHAPTERS = 20_000;
 const MAX_CHAPTER_BYTES = 8 * 1024 * 1024;
+/** All chapter text held for one export; keeps a huge book from exhausting the heap. */
+const MAX_TOTAL_TEXT_BYTES = 64 * 1024 * 1024;
 const MAX_COVER_BYTES = 5 * 1024 * 1024;
 const MAX_KEPT_JOBS = 20;
+/** Bytes per path component; leaves room under the common 255-byte limit. */
+const MAX_NAME_BYTES = 150;
+const ILLUSTRATION_NOTE = '（此处有插图，未保存到 EPUB）';
 const sleep = (ms: number, signal: AbortSignal) => new Promise<void>((done, fail) => {
   if (signal.aborted) { fail(signal.reason); return; }
   const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); done(); }, ms);
@@ -56,14 +64,14 @@ export class EpubExportService {
   private running: { job: EpubExportJob; controller: AbortController } | null = null;
   readonly dir: string;
 
-  constructor(private readonly host: SourceHost, dir: string, private readonly log?: FastifyBaseLogger) {
+  constructor(private readonly host: SourceHost, dir: string, private readonly booksDir: string, private readonly log?: FastifyBaseLogger) {
     this.dir = resolve(dir);
   }
 
   start(userId: string, sourceId: string, entryRef: string): EpubExportJob {
     const current = this.running?.job;
     if (current) {
-      if (current.sourceId === sourceId && current.entryRef === entryRef) return current;
+      if (current.userId === userId && current.sourceId === sourceId && current.entryRef === entryRef) return current;
       throw conflict(`正在保存《${current.title || '另一本书'}》,完成后再试`, 'EXPORT_BUSY');
     }
     const job: EpubExportJob = { id: randomUUID(), userId, sourceId, entryRef, title: '', state: 'running', done: 0, total: 0, startedAt: Date.now() };
@@ -98,24 +106,31 @@ export class EpubExportService {
     const { entry, publicationRef, sourceName } = await this.retrying(() => this.host.chapterPublication(job.userId, job.sourceId, job.entryRef, signal), signal);
     job.title = entry.title;
     const manifest = await this.retrying(() => this.host.manifest(job.userId, job.sourceId, publicationRef, signal), signal);
-    const items = manifest.items.filter((item) => item.kind === 'chapter');
+    // Reading order is `seq`, exactly as ChapterPublications.normalize() sorts it for the reader.
+    const items = manifest.items.filter((item) => item.kind === 'chapter').sort((a, b) => a.seq - b.seq);
     if (!items.length) throw badRequest('这本书没有章节', 'EMPTY_BOOK');
     if (items.length > MAX_CHAPTERS) throw badRequest(`章节数超过 ${MAX_CHAPTERS},暂不支持保存`, 'BOOK_TOO_LARGE');
     job.total = items.length;
 
     const chapters: Array<{ title: string; paragraphs: string[] }> = [];
+    let held = 0;
     for (const item of items) {
       signal.throwIfAborted();
       const resource = await this.retrying(() => this.host.resource(job.userId, job.sourceId, publicationRef, item.ref, signal), signal);
-      chapters.push({ title: item.title, paragraphs: paragraphs(await readText(resource), resource.mediaType) });
+      const text = await readText(resource);
+      held += Buffer.byteLength(text);
+      if (held > MAX_TOTAL_TEXT_BYTES) throw badRequest('这本书太大,暂不支持保存为 EPUB', 'BOOK_TOO_LARGE');
+      const body = paragraphs(text, resource.mediaType);
+      if (!body.length) throw badRequest(`「${item.title}」没有可读正文,已停止保存`, 'EMPTY_CHAPTER');
+      chapters.push({ title: item.title, paragraphs: body });
       job.done++;
     }
     const cover = await fetchCover(entry.coverUrl, signal).catch(() => undefined);
     const bytes = await buildEpub(entry, chapters, cover);
 
-    const target = this.target(sourceName || manifest.sourceName || job.sourceId, entry.title);
-    await mkdir(dirname(target), { recursive: true });
-    const temporary = `${target}.${randomUUID()}.part`;
+    const folder = await this.folder(safeName(sourceName || manifest.sourceName || job.sourceId));
+    const target = join(folder, `${safeName(entry.title, MAX_NAME_BYTES - 50)} [${safeName(job.entryRef, 40)}].epub`);
+    const temporary = join(folder, `.${randomUUID()}.part`);
     try {
       await writeFile(temporary, bytes);
       await rename(temporary, target);
@@ -124,11 +139,15 @@ export class EpubExportService {
     return relative(this.dir, target).split(sep).join('/');
   }
 
-  private target(source: string, title: string): string {
-    const file = resolve(this.dir, safeName(source), `${safeName(title)}.epub`);
-    const rel = relative(this.dir, file);
-    if (!rel || rel.startsWith('..') || rel.includes(`..${sep}`)) throw badRequest('invalid export path', 'PATH_TRAVERSAL');
-    return file;
+  /** The per-source folder, checked by canonical path to be inside the archive and outside the library. */
+  private async folder(name: string): Promise<string> {
+    const folder = join(this.dir, name);
+    await mkdir(folder, { recursive: true });
+    const [real, archive] = await Promise.all([realpath(folder), realpath(this.dir)]);
+    if (!inside(archive, real)) throw badRequest('invalid export path', 'PATH_TRAVERSAL');
+    const library = await realpath(this.booksDir).catch(() => resolve(this.booksDir));
+    if (inside(library, real)) throw badRequest('EPUB 保存目录不能在书库目录里', 'EXPORT_DISABLED');
+    return real;
   }
 
   /** The reader and an export share the source's two-call budget; wait instead of failing. */
@@ -144,10 +163,22 @@ export class EpubExportService {
   }
 }
 
-/** File-system-safe, still human readable (Chinese titles stay intact). */
-export function safeName(value: string): string {
-  const cleaned = value.normalize('NFC').replace(/[\u0000-\u001f\u007f/\\:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().replace(/^\.+/, '').trim();
-  return (cleaned || '未命名').slice(0, 100);
+/** True when `child` is `parent` itself or below it, compared by whole path components. */
+export function inside(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
+}
+
+/** File-system-safe, still human readable (Chinese titles stay intact); capped in UTF-8 bytes. */
+export function safeName(value: string, maxBytes = MAX_NAME_BYTES): string {
+  const cleaned = value.normalize('NFC').replace(/[\u0000-\u001f\u007f/\\:*?"<>|[\]]+/g, ' ').replace(/\s+/g, ' ').trim().replace(/^\.+/, '').trim();
+  let out = '', bytes = 0;
+  for (const char of cleaned || '未命名') {
+    const size = Buffer.byteLength(char);
+    if (bytes + size > maxBytes) break;
+    out += char; bytes += size;
+  }
+  return out.trim() || '未命名';
 }
 
 async function readText(resource: ResourceResponse): Promise<string> {
@@ -166,11 +197,18 @@ async function readText(resource: ResourceResponse): Promise<string> {
   return '';
 }
 
+/**
+ * Chapter body → plain paragraphs. HTML is reduced to text; an illustration is
+ * replaced by a visible note rather than vanishing, so an archive never looks
+ * complete when it is not.
+ */
 export function paragraphs(text: string, mediaType: string): string[] {
   let plain = text;
   if (/html|xml/i.test(mediaType)) {
-    plain = sanitize(text.replace(/<\s*br\s*\/?>/gi, '\n').replace(/<\/(p|div|h[1-6]|li|section|article)\s*>/gi, '\n'),
-      { allowedTags: [], allowedAttributes: {}, nonTextTags: ['script', 'style', 'textarea', 'noscript', 'title'] });
+    plain = sanitize(text
+      .replace(/<\s*img\b[^>]*>/gi, `\n${ILLUSTRATION_NOTE}\n`)
+      .replace(/<\s*br\s*\/?>/gi, '\n').replace(/<\/(p|div|h[1-6]|li|section|article)\s*>/gi, '\n'),
+    { allowedTags: [], allowedAttributes: {}, nonTextTags: ['script', 'style', 'textarea', 'noscript', 'title'] });
     plain = decodeEntities(plain);
   }
   return plain.split(/\n+|　　/).map((line) => line.replace(/^[\s　]+/, '').trim()).filter(Boolean);
@@ -243,24 +281,46 @@ export async function buildEpub(entry: CatalogEntry, chapters: Array<{ title: st
   return zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE', compressionOptions: { level: 6 }, mimeType: 'application/epub+zip' });
 }
 
-/** Covers come from plugin-supplied URLs: https only, public addresses only, bounded size. */
+/**
+ * The connection's own DNS answer is validated (no separate pre-check that a
+ * changed DNS answer could slip past), so a plugin-supplied cover URL can only
+ * reach public addresses. TLS still verifies the original hostname.
+ */
+export const publicOnlyLookup: LookupFunction = (hostname, options, callback) => {
+  lookup(hostname, { ...options, all: true }, (error, addresses) => {
+    if (error) { callback(error, '', 0); return; }
+    const list = (addresses as unknown as Array<{ address: string; family: number }>);
+    const allowed = list.filter(({ address }) => !privateAddress(address));
+    if (!allowed.length || allowed.length !== list.length) {
+      callback(Object.assign(new Error('cover host resolves to a non-public address'), { code: 'EADDRNOTAVAIL' }), '', 0); return;
+    }
+    if ((options as { all?: boolean }).all) (callback as unknown as (e: null, a: typeof allowed) => void)(null, allowed);
+    else callback(null, allowed[0]!.address, allowed[0]!.family);
+  });
+};
+
 async function fetchCover(url: string | undefined, signal: AbortSignal): Promise<{ bytes: Uint8Array; mediaType: string } | undefined> {
   if (!url) return undefined;
   const parsed = new URL(url);
   if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return undefined;
   const host = parsed.hostname.replace(/^\[|\]$/g, '');
-  const addresses = isIP(host) ? [{ address: host }] : await lookup(host, { all: true });
-  if (!addresses.length || addresses.some(({ address }) => privateAddress(address))) return undefined;
-  const response = await fetch(parsed, { redirect: 'manual', signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) });
-  const mediaType = (response.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
-  if (!response.ok || !['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(mediaType)) { await response.body?.cancel(); return undefined; }
-  const chunks: Uint8Array[] = []; let size = 0;
-  for await (const chunk of response.body ?? []) {
-    size += chunk.byteLength;
-    if (size > MAX_COVER_BYTES) return undefined;
-    chunks.push(chunk);
-  }
-  return { bytes: Buffer.concat(chunks), mediaType };
+  if (isIP(host) && privateAddress(host)) return undefined;
+  return new Promise((done, fail) => {
+    const req = httpsRequest(parsed, { method: 'GET', lookup: publicOnlyLookup, signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) }, (response) => {
+      const mediaType = String(response.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
+      if (response.statusCode !== 200 || !['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(mediaType)) { response.resume(); done(undefined); return; }
+      const chunks: Buffer[] = []; let size = 0;
+      response.on('data', (chunk: Buffer) => {
+        size += chunk.byteLength;
+        if (size > MAX_COVER_BYTES) { req.destroy(); done(undefined); return; }
+        chunks.push(chunk);
+      });
+      response.on('end', () => done(size > MAX_COVER_BYTES ? undefined : { bytes: Buffer.concat(chunks), mediaType }));
+      response.on('error', fail);
+    });
+    req.on('error', fail);
+    req.end();
+  });
 }
 
 export function privateAddress(address: string): boolean {
