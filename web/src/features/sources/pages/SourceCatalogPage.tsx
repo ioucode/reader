@@ -9,6 +9,8 @@ import type { SourceEntry, SourcePage } from '../../../api/sources.ts';
 import { useRuntime } from '../../../app/providers/runtime-context.tsx';
 import { useSources } from '../hooks/sourceQueries.ts';
 import { FloatingNotice } from '../../../ui/floating-notice.tsx';
+import { useAuthStore } from '../../../shared/stores/auth.store.ts';
+import { useEpubExport } from '../hooks/useEpubExport.ts';
 
 export function mergePages(current: SourcePage | undefined, page: SourcePage): SourcePage {
   const items = new Map((current?.items ?? []).map(item => [item.ref, item]));
@@ -33,6 +35,8 @@ export function SourceCatalogPage() {
   const [cursor, setCursor] = useState<string | undefined>(params.get('cursor') ?? undefined);
   const sessionId = useRef<string | null>(null);
   const [filters, setFilters] = useState<Record<string, string>>({});
+  const admin = useAuthStore(state => state.verifiedUser?.role === 'admin');
+  const epub = useEpubExport(sourceId);
   const filterQuery = useQuery({ queryKey: ['source-filters', api.baseUrl, sourceId], queryFn: () => api.sourceFilters(sourceId), enabled: !!source?.descriptor?.capabilities.includes('search.filters') });
   const detailQuery = useQuery({ queryKey: ['source-detail', api.baseUrl, sourceId, detail?.ref], queryFn: () => api.sourceDetail(sourceId, detail!.ref), enabled: !!detail });
   const acquire = useMutation({ mutationFn: ({ ref, option }: { ref: string; option?: string }) => api.acquireSource(sourceId, ref, option), onError: reason => notify(reason instanceof Error ? reason.message : '加入书架失败', { kind: 'error' }) });
@@ -61,6 +65,8 @@ export function SourceCatalogPage() {
   if (!source) return <div className="sources-screen source-catalog-screen"><SourcesHeader title="选择书源" /><main className="sources-body"><section className="sources-card source-picker"><h2>选择来源</h2><p className="muted">选择一个已启用的书源开始搜索或浏览</p><label>书源<select defaultValue="" onChange={event => { const value = event.currentTarget.value; if (value) navigate(`/sources/${encodeURIComponent(value)}/browse`); }}><option value="" disabled>选择来源</option>{sources.data?.filter(item => item.enabled && item.descriptor).map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></section></main></div>;
   const supportsSearch = source.descriptor?.capabilities.includes('search');
   const supportsBrowse = source.descriptor?.capabilities.includes('browse');
+  // 「保存 EPUB」只对按章节提供内容的书源有意义,且写入的是服务器共享存档,仅管理员可用。
+  const supportsEpub = admin && !!source.descriptor?.capabilities.includes('content.manifest');
   return <div className="sources-screen source-catalog-screen">
     <SourcesHeader title={source.name} subtitle={source.descriptor?.label ?? '书源目录'} />
     <main className="sources-body">
@@ -72,9 +78,9 @@ export function SourceCatalogPage() {
     {page?.errors?.map(item => <Callout tone="warning" key={`${item.source}-${item.code}`}>{item.source}: {item.message}</Callout>)}
     {!page && !busy && <Callout>输入关键词搜索，或浏览书源目录</Callout>}
     {busy && !page && <FloatingNotice message="正在搜索…" busy />}
-    <section className="sources-card"><div className="source-results">{page?.items.map(item => { const option = item.options?.[0]; return <article className="sources-row catalog-book" key={item.ref}><div><strong>{item.title}</strong>{item.latestChapter && <small>{item.latestChapter}</small>}{item.authors?.length ? <small>{item.authors.join('、')}</small> : null}{item.description && <p className="source-description">{item.description}</p>}</div><div className="sources-actions"><Button onClick={() => setDetail(item)}>详情</Button><Button className="primary" disabled={(option?.available === false) || (acquire.isPending)} onClick={() => acquireEntry(item, option?.id)}>{option?.label ?? '加入书架'}</Button></div></article>; })}</div></section>
+    <section className="sources-card"><div className="source-results">{page?.items.map(item => { const option = item.options?.[0]; return <article className="sources-row catalog-book" key={item.ref}><div><strong>{item.title}</strong>{item.latestChapter && <small>{item.latestChapter}</small>}{item.authors?.length ? <small>{item.authors.join('、')}</small> : null}{item.description && <p className="source-description">{item.description}</p>}</div><div className="sources-actions"><Button onClick={() => setDetail(item)}>详情</Button>{supportsEpub && <Button disabled={!!epub.savingRef} onClick={() => void epub.save(item)}>{epub.savingRef === item.ref ? '正在保存…' : '保存 EPUB'}</Button>}<Button className="primary" disabled={(option?.available === false) || (acquire.isPending)} onClick={() => acquireEntry(item, option?.id)}>{option?.label ?? '加入书架'}</Button></div></article>; })}</div></section>
     {page && !busy && page.items.length === 0 && <Callout>没有找到匹配的书籍</Callout>}
-    {detail && <SourceBookDetailSheet detail={detail} pending={detailQuery.isPending} error={detailQuery.error} acquiring={acquire.isPending} onAcquire={acquireEntry} onClose={() => setDetail(null)} />}
+    {detail && <SourceBookDetailSheet detail={detail} pending={detailQuery.isPending} error={detailQuery.error} acquiring={acquire.isPending} onAcquire={acquireEntry} {...(supportsEpub ? { onSaveEpub: (entry: SourceEntry) => void epub.save(entry), savingEpub: !!epub.savingRef } : {})} onClose={() => setDetail(null)} />}
     </main>
   </div>;
 }

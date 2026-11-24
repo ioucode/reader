@@ -28,7 +28,7 @@ import type {
   User,
 } from './types.ts';
 import type { Platform } from '../core/platform.ts';
-import type { SourceType, SourceInstance, SourcePlugin, SourceEntry, SourcePage, SourceAcquisition, ChapterSubscription } from './sources.ts';
+import type { SourceType, SourceInstance, SourcePlugin, SourceEntry, SourcePage, SourceAcquisition, ChapterSubscription, EpubExportJob } from './sources.ts';
 import { isCancelledError } from '@tanstack/query-core';
 import { affectedNavigationQuery, createReaderQueryClient, isLiveNavigationQuery, isNavigationQuery, readerQueryKey } from './query.ts';
 
@@ -364,6 +364,12 @@ export class ReaderApi {
   }
   async acquireSource(id: string, entryRef: string, optionId?: string): Promise<SourceAcquisition> {
     return this.call(`/api/v1/sources/${encodeURIComponent(id)}/acquire`, 'POST', { entryRef, ...(optionId ? { optionId } : {}) });
+  }
+  async startEpubExport(id: string, entryRef: string): Promise<EpubExportJob> {
+    return (await this.call<{ job: EpubExportJob }>(`/api/v1/sources/${encodeURIComponent(id)}/epub-exports`, 'POST', { entryRef })).job;
+  }
+  async epubExport(jobId: string): Promise<EpubExportJob> {
+    return (await this.get<{ job: EpubExportJob }>(`/api/v1/epub-exports/${encodeURIComponent(jobId)}`)).job;
   }
   async subscriptions(): Promise<ChapterSubscription[]> {
     return (await this.get<{ subscriptions: ChapterSubscription[] }>('/api/v1/subscriptions')).subscriptions;

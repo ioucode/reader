@@ -7,19 +7,23 @@ import { FloatingNotice } from '../../../ui/floating-notice.tsx';
  * A source result's detail, shared by the source hub and a single source's catalog:
  * they show the same entry and offer the same 加入书架 choices.
  */
-export function SourceBookDetailSheet({ detail, pending, error, acquiring, onAcquire, onClose }: {
+export function SourceBookDetailSheet({ detail, pending, error, acquiring, onAcquire, onSaveEpub, savingEpub = false, onClose }: {
   detail: SourceEntry;
   pending: boolean;
   error: Error | null;
   acquiring: boolean;
   onAcquire(entry: SourceEntry, option?: string): void;
+  /** 「保存 EPUB」:只在书源按章节提供内容且当前用户是管理员时传入。 */
+  onSaveEpub?(entry: SourceEntry): void;
+  savingEpub?: boolean;
   onClose(): void;
 }) {
   const options = detail.options ?? [];
+  const save = onSaveEpub && <Button disabled={savingEpub} onClick={() => onSaveEpub(detail)}>{savingEpub ? '正在保存…' : '保存 EPUB'}</Button>;
   return <Sheet title={detail.title || '书籍详情'} onClose={onClose}
-    footer={options.length
+    footer={<>{save}{options.length
       ? options.map(option => <Button key={option.id} className="primary" disabled={option.available === false || acquiring} onClick={() => onAcquire(detail, option.id)}>{option.label}</Button>)
-      : <Button className="primary" disabled={acquiring} onClick={() => onAcquire(detail)}>加入书架</Button>}>
+      : <Button className="primary" disabled={acquiring} onClick={() => onAcquire(detail)}>加入书架</Button>}</>}>
     <FloatingNotice message={pending ? '正在读取书籍详情…' : ''} busy />
     <div className="book-detail">
       <p className="book-detail-author">{detail.authors?.join('、') || '作者未知'}</p>
