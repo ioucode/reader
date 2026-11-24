@@ -112,7 +112,7 @@ describe('EpubExportService', () => {
       const job = service.start('u1', 's1', 'e1');
       await until(() => job.state !== 'running');
       assert.equal(job.state, 'failed');
-      assert.match(job.error ?? '', /没有可读正文/);
+      assert.match(job.error ?? '', /没有可读文字/);
       await assert.rejects(readdir(join(dir, '某书源')));
     } finally { await rm(root, { recursive: true, force: true }); }
   });
@@ -129,14 +129,17 @@ describe('EpubExportService', () => {
   });
 
   test('fails on an illustration-only chapter and on invalid UTF-8', async () => {
-    for (const [resource, pattern] of [
-      [{ mediaType: 'text/html', text: '<p><img src="reader-res:x"></p>' }, /插图章节/],
-      [{ mediaType: 'text/plain', data: new Uint8Array([0xff, 0xfe, 0xfd]) }, /UTF-8/],
-      [{ mediaType: 'image/png', text: 'x' }, /不是文本章节/],
+    for (const [declared, resource, pattern] of [
+      ['text/html', { mediaType: 'text/html', text: '<p><img src="reader-res:x"></p>' }, /插图章节/],
+      ['text/plain', { mediaType: 'text/plain', data: new Uint8Array([0xff, 0xfe, 0xfd]) }, /UTF-8/],
+      ['text/plain', { mediaType: 'image/png', text: 'x' }, /文本章节/],
+      ['text/html', { mediaType: 'text/plain', text: '<p>声明是 HTML,实际是纯文本</p>' }, /文本章节/],
+      ['text/plain', { mediaType: 'text/plain', text: '\u0000\u0001\u202e' }, /没有可读文字/],
     ] as const) {
       const { root, dir, books } = await fixture();
       try {
-        const service = new EpubExportService(host({ resource: async () => resource }), dir, books);
+        const manifest = async () => ({ publicationRef: 'p1', items: [{ id: 'a', seq: 0, title: '一', kind: 'chapter', mediaType: declared, ref: 'r1' }] });
+        const service = new EpubExportService(host({ manifest, resource: async () => resource }), dir, books);
         const job = service.start('u1', 's1', 'e1');
         await until(() => job.state !== 'running');
         assert.equal(job.state, 'failed');

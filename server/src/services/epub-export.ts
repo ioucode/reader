@@ -8,6 +8,7 @@ import JSZip from 'jszip';
 import { Parser } from 'htmlparser2';
 import type { FastifyBaseLogger } from 'fastify';
 import { AppError, badRequest, conflict, notFound } from '../lib/errors.ts';
+import { chapterMedia } from '../publications/rich-content.ts';
 import type { CatalogEntry, ResourceResponse } from '../sources/types.ts';
 import type { SourceHost } from './source-host.ts';
 
@@ -118,15 +119,21 @@ export class EpubExportService {
     for (const item of items) {
       signal.throwIfAborted();
       const resource = await this.retrying(() => this.host.resource(job.userId, job.sourceId, publicationRef, item.ref, signal), signal);
-      if (!/^(text\/plain|text\/html|application\/xhtml\+xml)\b/i.test(resource.mediaType.trim())) {
+      // Same media rules as the reader: normalized, and the resource must match what the manifest declared.
+      let media: string;
+      try {
+        media = chapterMedia(resource.mediaType);
+        if (media !== chapterMedia(item.mediaType)) throw new Error('mismatch');
+      } catch {
         resource.stream?.destroy();
-        throw badRequest(`「${item.title}」不是文本章节,无法保存为 EPUB`, 'UNSUPPORTED_FORMAT');
+        throw badRequest(`「${item.title}」不是有效的文本章节,无法保存为 EPUB`, 'UNSUPPORTED_FORMAT');
       }
       const text = await readText(resource, item.title);
-      const body = paragraphs(text, resource.mediaType);
+      // Budget the raw body: trimmed paragraphs may still share memory with it.
+      held += Buffer.byteLength(text);
+      if (held > MAX_TOTAL_TEXT_BYTES) throw badRequest('这本书太大,暂不支持保存为 EPUB', 'BOOK_TOO_LARGE');
+      const body = paragraphs(text, media);
       if (!body.some((line) => line !== ILLUSTRATION_NOTE)) throw badRequest(`「${item.title}」没有可读文字(插图章节暂不支持),已停止保存`, 'EMPTY_CHAPTER');
-      // Budget what is actually retained (text plus per-paragraph overhead), not just the raw body.
-      held += body.reduce((sum, line) => sum + Buffer.byteLength(line) + 64, 0);
       paragraphCount += body.length;
       if (held > MAX_TOTAL_TEXT_BYTES || paragraphCount > MAX_TOTAL_PARAGRAPHS) throw badRequest('这本书太大,暂不支持保存为 EPUB', 'BOOK_TOO_LARGE');
       chapters.push({ title: item.title, paragraphs: body });
@@ -137,8 +144,8 @@ export class EpubExportService {
 
     const { folder, archive } = await this.folder(safeName(sourceName || manifest.sourceName || job.sourceId));
     // Readable title + a stable digest of the source and publication, so distinct books never collide.
-    const digest = createHash('sha256').update(`${job.sourceId}\0${publicationRef}`).digest('hex').slice(0, 8);
-    const target = join(folder, `${safeName(entry.title, MAX_NAME_BYTES - 20)} [${digest}].epub`);
+    const digest = createHash('sha256').update(`${job.sourceId}\0${publicationRef}`).digest('hex').slice(0, 32);
+    const target = join(folder, `${safeName(entry.title, MAX_NAME_BYTES - 45)} [${digest}].epub`);
     const temporary = join(folder, `.${randomUUID()}.part`);
     try {
       await writeFile(temporary, bytes);
@@ -214,7 +221,8 @@ async function readText(resource: ResourceResponse, title: string): Promise<stri
   catch { throw badRequest(`「${title}」不是有效的 UTF-8 文本,已停止保存`, 'UNSUPPORTED_FORMAT'); }
 }
 
-const INVISIBLE = /[\u200b-\u200f\u2028\u2029\u2060-\u206f\ufeff\u00ad]/g;
+// Zero-width, bidi and XML-forbidden control characters: a line of only these is not readable text.
+const INVISIBLE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u206f\ufeff\ufffe\uffff\u00ad]/g;
 const BLOCK = new Set(['p', 'div', 'br', 'li', 'section', 'article', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'tr', 'pre']);
 const SKIPPED = new Set(['script', 'style', 'textarea', 'noscript', 'title', 'template']);
 
