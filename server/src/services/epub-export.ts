@@ -1,11 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lookup } from 'node:dns';
 import { request as httpsRequest } from 'node:https';
 import { isIP, type LookupFunction } from 'node:net';
 import { mkdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import JSZip from 'jszip';
-import sanitize from 'sanitize-html';
+import { Parser } from 'htmlparser2';
 import type { FastifyBaseLogger } from 'fastify';
 import { AppError, badRequest, conflict, notFound } from '../lib/errors.ts';
 import type { CatalogEntry, ResourceResponse } from '../sources/types.ts';
@@ -46,7 +46,8 @@ export interface EpubExportJob {
 const MAX_CHAPTERS = 20_000;
 const MAX_CHAPTER_BYTES = 8 * 1024 * 1024;
 /** All chapter text held for one export; keeps a huge book from exhausting the heap. */
-const MAX_TOTAL_TEXT_BYTES = 64 * 1024 * 1024;
+const MAX_TOTAL_TEXT_BYTES = 32 * 1024 * 1024;
+const MAX_TOTAL_PARAGRAPHS = 500_000;
 const MAX_COVER_BYTES = 5 * 1024 * 1024;
 const MAX_KEPT_JOBS = 20;
 /** Bytes per path component; leaves room under the common 255-byte limit. */
@@ -113,41 +114,49 @@ export class EpubExportService {
     job.total = items.length;
 
     const chapters: Array<{ title: string; paragraphs: string[] }> = [];
-    let held = 0;
+    let held = 0, paragraphCount = 0;
     for (const item of items) {
       signal.throwIfAborted();
       const resource = await this.retrying(() => this.host.resource(job.userId, job.sourceId, publicationRef, item.ref, signal), signal);
-      const text = await readText(resource);
-      held += Buffer.byteLength(text);
-      if (held > MAX_TOTAL_TEXT_BYTES) throw badRequest('这本书太大,暂不支持保存为 EPUB', 'BOOK_TOO_LARGE');
+      if (!/^(text\/plain|text\/html|application\/xhtml\+xml)\b/i.test(resource.mediaType.trim())) {
+        resource.stream?.destroy();
+        throw badRequest(`「${item.title}」不是文本章节,无法保存为 EPUB`, 'UNSUPPORTED_FORMAT');
+      }
+      const text = await readText(resource, item.title);
       const body = paragraphs(text, resource.mediaType);
-      if (!body.length) throw badRequest(`「${item.title}」没有可读正文,已停止保存`, 'EMPTY_CHAPTER');
+      if (!body.some((line) => line !== ILLUSTRATION_NOTE)) throw badRequest(`「${item.title}」没有可读文字(插图章节暂不支持),已停止保存`, 'EMPTY_CHAPTER');
+      // Budget what is actually retained (text plus per-paragraph overhead), not just the raw body.
+      held += body.reduce((sum, line) => sum + Buffer.byteLength(line) + 64, 0);
+      paragraphCount += body.length;
+      if (held > MAX_TOTAL_TEXT_BYTES || paragraphCount > MAX_TOTAL_PARAGRAPHS) throw badRequest('这本书太大,暂不支持保存为 EPUB', 'BOOK_TOO_LARGE');
       chapters.push({ title: item.title, paragraphs: body });
       job.done++;
     }
     const cover = await fetchCover(entry.coverUrl, signal).catch(() => undefined);
     const bytes = await buildEpub(entry, chapters, cover);
 
-    const folder = await this.folder(safeName(sourceName || manifest.sourceName || job.sourceId));
-    const target = join(folder, `${safeName(entry.title, MAX_NAME_BYTES - 50)} [${safeName(job.entryRef, 40)}].epub`);
+    const { folder, archive } = await this.folder(safeName(sourceName || manifest.sourceName || job.sourceId));
+    // Readable title + a stable digest of the source and publication, so distinct books never collide.
+    const digest = createHash('sha256').update(`${job.sourceId}\0${publicationRef}`).digest('hex').slice(0, 8);
+    const target = join(folder, `${safeName(entry.title, MAX_NAME_BYTES - 20)} [${digest}].epub`);
     const temporary = join(folder, `.${randomUUID()}.part`);
     try {
       await writeFile(temporary, bytes);
       await rename(temporary, target);
     } finally { await rm(temporary, { force: true }); }
     this.log?.info({ sourceId: job.sourceId, chapters: items.length, bytes: bytes.byteLength }, 'epub export saved');
-    return relative(this.dir, target).split(sep).join('/');
+    return relative(archive, target).split(sep).join('/');
   }
 
   /** The per-source folder, checked by canonical path to be inside the archive and outside the library. */
-  private async folder(name: string): Promise<string> {
+  private async folder(name: string): Promise<{ folder: string; archive: string }> {
     const folder = join(this.dir, name);
     await mkdir(folder, { recursive: true });
     const [real, archive] = await Promise.all([realpath(folder), realpath(this.dir)]);
     if (!inside(archive, real)) throw badRequest('invalid export path', 'PATH_TRAVERSAL');
     const library = await realpath(this.booksDir).catch(() => resolve(this.booksDir));
     if (inside(library, real)) throw badRequest('EPUB 保存目录不能在书库目录里', 'EXPORT_DISABLED');
-    return real;
+    return { folder: real, archive };
   }
 
   /** The reader and an export share the source's two-call budget; wait instead of failing. */
@@ -181,53 +190,65 @@ export function safeName(value: string, maxBytes = MAX_NAME_BYTES): string {
   return out.trim() || '未命名';
 }
 
-async function readText(resource: ResourceResponse): Promise<string> {
-  if (resource.text !== undefined) return resource.text;
-  if (resource.data) return Buffer.from(resource.data).subarray(0, MAX_CHAPTER_BYTES).toString('utf8');
-  if (resource.stream) {
+/** Strict UTF-8: a mis-decoded chapter (U+FFFD soup) must fail, not be archived. Oversize fails too. */
+async function readText(resource: ResourceResponse, title: string): Promise<string> {
+  const tooLarge = () => badRequest(`「${title}」正文过大,已停止保存`, 'BOOK_TOO_LARGE');
+  if (resource.text !== undefined) {
+    if (Buffer.byteLength(resource.text) > MAX_CHAPTER_BYTES) throw tooLarge();
+    return resource.text;
+  }
+  let bytes: Buffer;
+  if (resource.data) bytes = Buffer.from(resource.data);
+  else if (resource.stream) {
     const chunks: Buffer[] = []; let size = 0;
     for await (const chunk of resource.stream) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
       size += buffer.byteLength;
-      if (size > MAX_CHAPTER_BYTES) { resource.stream.destroy(); break; }
+      if (size > MAX_CHAPTER_BYTES) { resource.stream.destroy(); throw tooLarge(); }
       chunks.push(buffer);
     }
-    return Buffer.concat(chunks).toString('utf8');
-  }
-  return '';
+    bytes = Buffer.concat(chunks);
+  } else return '';
+  if (bytes.byteLength > MAX_CHAPTER_BYTES) throw tooLarge();
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch { throw badRequest(`「${title}」不是有效的 UTF-8 文本,已停止保存`, 'UNSUPPORTED_FORMAT'); }
 }
 
+const INVISIBLE = /[\u200b-\u200f\u2028\u2029\u2060-\u206f\ufeff\u00ad]/g;
+const BLOCK = new Set(['p', 'div', 'br', 'li', 'section', 'article', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'tr', 'pre']);
+const SKIPPED = new Set(['script', 'style', 'textarea', 'noscript', 'title', 'template']);
+
 /**
- * Chapter body → plain paragraphs. HTML is reduced to text; an illustration is
- * replaced by a visible note rather than vanishing, so an archive never looks
- * complete when it is not.
+ * Chapter body → plain paragraphs. HTML goes through a real parser (entities
+ * decoded, script/style dropped, `>` inside attributes harmless); an
+ * illustration becomes a visible note rather than vanishing, so an archive
+ * never looks complete when it is not.
  */
 export function paragraphs(text: string, mediaType: string): string[] {
   let plain = text;
   if (/html|xml/i.test(mediaType)) {
-    plain = sanitize(text
-      .replace(/<\s*img\b[^>]*>/gi, `\n${ILLUSTRATION_NOTE}\n`)
-      .replace(/<\s*br\s*\/?>/gi, '\n').replace(/<\/(p|div|h[1-6]|li|section|article)\s*>/gi, '\n'),
-    { allowedTags: [], allowedAttributes: {}, nonTextTags: ['script', 'style', 'textarea', 'noscript', 'title'] });
-    plain = decodeEntities(plain);
+    const parts: string[] = []; let skip = 0;
+    const parser = new Parser({
+      onopentag(name) {
+        if (SKIPPED.has(name)) skip++;
+        else if (!skip && name === 'img') parts.push(`\n${ILLUSTRATION_NOTE}\n`);
+        else if (!skip && BLOCK.has(name)) parts.push('\n');
+      },
+      ontext(data) { if (!skip) parts.push(data); },
+      onclosetag(name) {
+        if (SKIPPED.has(name)) skip = Math.max(0, skip - 1);
+        else if (!skip && BLOCK.has(name)) parts.push('\n');
+      },
+    }, { decodeEntities: true });
+    parser.end(text);
+    plain = parts.join('');
   }
-  return plain.split(/\n+|　　/).map((line) => line.replace(/^[\s　]+/, '').trim()).filter(Boolean);
-}
-
-function decodeEntities(value: string): string {
-  const named: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
-  return value.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, code: string) => {
-    if (code[0] === '#') {
-      const point = code[1]?.toLowerCase() === 'x' ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
-      return Number.isFinite(point) && point > 0 && point < 0x110000 ? String.fromCodePoint(point) : match;
-    }
-    return named[code.toLowerCase()] ?? match;
-  });
+  return plain.split(/\n+|　　/).map((line) => line.replace(INVISIBLE, '').replace(/^[\s　]+/, '').trim()).filter((line) => line && !/^\ufffd+$/.test(line));
 }
 
 const xml = (value: string) => value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]!))
   // XML 1.0 forbids most control characters; a single one makes the whole chapter unreadable.
-  .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f￾￿]/g, '');
+  .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/g, '');
 
 function xhtml(title: string, body: string): string {
   return '<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN">'
@@ -330,7 +351,13 @@ export function privateAddress(address: string): boolean {
       || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)) || a >= 224;
   }
   const lower = address.toLowerCase();
-  if (lower.startsWith('::ffff:')) return privateAddress(lower.slice(7));
+  if (lower.startsWith('::ffff:')) {
+    const rest = lower.slice(7);
+    // IPv4-mapped in hex form (::ffff:a00:1) → dotted quad before judging.
+    const hex = rest.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hex) { const hi = parseInt(hex[1]!, 16), lo = parseInt(hex[2]!, 16); return privateAddress(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`); }
+    return privateAddress(rest);
+  }
   return lower === '::' || lower === '::1' || /^f[cd]/.test(lower) || /^fe[89ab]/.test(lower) || lower.startsWith('ff');
 }
 
