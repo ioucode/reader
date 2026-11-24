@@ -27,6 +27,7 @@
 | --- | --- | --- |
 | `BOOKS_DIR` | `/books` | 书籍目录 |
 | `DATA_DIR` | 当前工作目录下的 `data` | 服务端状态和缓存目录 |
+| `EPUB_EXPORT_DIR` | `DATA_DIR/epub-archive` | 「保存 EPUB」的存档目录，按 `<书源>/<书名>.epub` 存放；不能位于 `BOOKS_DIR` 内（否则该功能停用），以免存档被扫进书库 |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `PORT` | `5888` | 监听端口 |
 | `READER_TOKEN_SECRET` | 自动生成 | 至少 16 字符的签名密钥；默认保存在 `DATA_DIR/token.secret` |

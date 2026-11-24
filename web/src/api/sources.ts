@@ -19,6 +19,11 @@ export interface SourcePage {
   errors?: Array<{ source: string; code: string; message: string }>;
   batch?: { completed: number; total: number };
 }
+/** 「保存 EPUB」后台任务:file 是相对 EPUB 存档目录的路径(<书源>/<书名>.epub)。 */
+export interface EpubExportJob {
+  id: string; sourceId: string; entryRef: string; title: string;
+  state: 'running' | 'done' | 'failed'; done: number; total: number; file?: string; error?: string;
+}
 export interface SourceAcquisition {
   kind: 'ready' | 'action-required'; publicationId?: string;
   action?: { label: string; url?: string };

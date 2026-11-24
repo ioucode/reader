@@ -884,6 +884,8 @@ manifest 的每个条目还带 `ref`，即这个文件对应的**资源引用**�
 | GET /sources/:id/search-filters | 来源声明的搜索筛选项 |
 | GET /sources/:id/entries?ref=条目引用 | 查询条目详情 |
 | POST /sources/:id/acquire | body `{entryRef, optionId?}`，获取条目并加入当前账号书架 → `{kind:"ready", publicationId}` |
+| POST /sources/:id/epub-exports | 管理员；body `{entryRef}`，把按章节提供内容的条目在后台保存为 EPUB（不加入书架），同一时间只跑一个 → 202 `{job}` |
+| GET /epub-exports/:jobId | 管理员；查询保存进度 → `{job:{state:"running"\|"done"\|"failed", done, total, file?, error?}}`，`file` 相对 `EPUB_EXPORT_DIR` |
 | GET /sources/:id/credentials | 当前账号在该来源的凭据状态：`available`、`fields:[{key,label,configured}]` 等，不含明文 |
 | PUT /sources/:id/credentials/:key、DELETE 同路径 | 保存（body `{value}`）/ 删除当前账号的一项凭据 → `{ok:true}` |
 | GET /sources/:id/publications/:publicationRef/manifest | 调试用：直接读取来源的章节目录 |

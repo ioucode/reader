@@ -12,6 +12,7 @@ import type { ExtensionField, SourceEntry, SourcePage } from '../../../api/sourc
 import { useRuntime } from '../../../app/providers/runtime-context.tsx';
 import { FloatingNotice } from '../../../ui/floating-notice.tsx';
 import { useAuthStore } from '../../../shared/stores/auth.store.ts';
+import { useEpubExport } from '../hooks/useEpubExport.ts';
 import { mergePages } from './SourceCatalogPage.tsx';
 import { SearchableSelect } from '../../../ui/searchable-select.tsx';
 import { groupSourceResults } from '../../../ui/source-results.ts';
@@ -58,8 +59,11 @@ export function SourcesPage() {
   const enabledSources = (sources.data ?? []).filter(source => source.enabled && source.descriptor);
   const selectedSourceId = sourceId || enabledSources.find(source => source.isDefault)?.id || enabledSources[0]?.id || '';
   const selectedSource = enabledSources.find(source => source.id === selectedSourceId);
+  // 「保存 EPUB」:只对按章节提供内容的书源开放,且仅管理员可用(写入服务器共享存档)。
+  const supportsEpub = admin && !!selectedSource?.descriptor?.capabilities.includes('content.manifest');
   const sourceFilters = useQuery({ queryKey: ['source-filters', runtime.api.baseUrl, selectedSourceId], queryFn: () => runtime.api.sourceFilters(selectedSourceId), enabled: !!selectedSourceId && !!selectedSource?.descriptor?.capabilities.includes('search.filters') });
   const detailQuery = useQuery({ queryKey: ['source-detail', runtime.api.baseUrl, selectedSourceId, detail?.ref], queryFn: () => runtime.api.sourceDetail(selectedSourceId, detail!.ref), enabled: !!detail });
+  const epub = useEpubExport(selectedSourceId);
   const acquire = useMutation({ mutationFn: ({ ref, option }: { ref: string; option?: string }) => runtime.api.acquireSource(selectedSourceId, ref, option), onError: reason => notify(reason instanceof Error ? reason.message : '加入书架失败', { kind: 'error' }) });
   const grouped = searchState !== 'idle' && !(selectedSource?.descriptor?.builtin && selectedSource.sourceType === 'local');
   const results = groupSourceResults(catalogPage?.items ?? [], grouped);
@@ -152,7 +156,7 @@ export function SourcesPage() {
           {catalogPage && <CatalogFeedback page={catalogPage} count={results.length} merged={searchState !== 'idle'} searching={searchState === 'searching'} />}
           {catalogPage?.navigation && <div className="source-navigation">{catalogPage.navigation.map(item => <Button  key={item.ref} onClick={() => void loadCatalog(item.ref)}>{item.title}</Button>)}</div>}
           {catalogBusy && !catalogPage && <FloatingNotice message="正在加载目录…" busy />}
-          {catalogPage && <div className="source-results">{results.filter(group => { const q = resultGroupQuery.trim().toLocaleLowerCase(); return !q || group.entry.title.toLocaleLowerCase().includes(q) || group.entry.authors?.some(author => author.toLocaleLowerCase().includes(q)); }).map(group => <article className="sources-row catalog-book" key={group.key}><div><strong>{group.entry.title}</strong><small>{group.entry.authors?.join(' / ') || '作者未知'}</small>{!grouped && group.entry.description && <p className="source-description">{group.entry.description}</p>}</div>{grouped ? <button className="button catalog-source-count" type="button" onClick={() => setResultGroupKey(group.key)}><span>{group.entries.length} 条书源</span><Icon name="chevron-right" size={16} /></button> : <div className="sources-actions"><button className="button" type="button" onClick={() => setDetail(group.entry)}>详情</button>{(group.entry.options?.length ? group.entry.options : [{ id: '', label: '加入书架' }]).map(option => <button className="button primary" type="button" key={option.id} disabled={option.available === false || acquire.isPending} onClick={() => acquireEntry(group.entry, option.id)}>{option.label}</button>)}</div>}</article>)}</div>}
+          {catalogPage && <div className="source-results">{results.filter(group => { const q = resultGroupQuery.trim().toLocaleLowerCase(); return !q || group.entry.title.toLocaleLowerCase().includes(q) || group.entry.authors?.some(author => author.toLocaleLowerCase().includes(q)); }).map(group => <article className="sources-row catalog-book" key={group.key}><div><strong>{group.entry.title}</strong><small>{group.entry.authors?.join(' / ') || '作者未知'}</small>{!grouped && group.entry.description && <p className="source-description">{group.entry.description}</p>}</div>{grouped ? <button className="button catalog-source-count" type="button" onClick={() => setResultGroupKey(group.key)}><span>{group.entries.length} 条书源</span><Icon name="chevron-right" size={16} /></button> : <div className="sources-actions"><button className="button" type="button" onClick={() => setDetail(group.entry)}>详情</button>{supportsEpub && <button className="button" type="button" disabled={!!epub.savingRef} onClick={() => void epub.save(group.entry)}>{epub.savingRef === group.entry.ref ? '正在保存…' : '保存 EPUB'}</button>}{(group.entry.options?.length ? group.entry.options : [{ id: '', label: '加入书架' }]).map(option => <button className="button primary" type="button" key={option.id} disabled={option.available === false || acquire.isPending} onClick={() => acquireEntry(group.entry, option.id)}>{option.label}</button>)}</div>}</article>)}</div>}
           {catalogPage && !catalogBusy && !catalogPage.items.length && <div className="catalog-empty"><strong>没有找到匹配书籍</strong><p>试试其他关键词，或调整搜索范围。</p></div>}
           {searchState === 'complete' && catalogPage?.nextCursor && <div className="catalog-pagination"><button className="button" type="button" disabled={!canResume} onClick={() => void searchSources(true)}>加载更多结果</button></div>}
           {acquired && <button className="button" type="button" onClick={() => navigate(`/book/${encodeURIComponent(acquired.id)}`)}>阅读《{acquired.title}》</button>}
@@ -178,6 +182,6 @@ export function SourcesPage() {
         {activeGroup.entries.filter(entry => (entry.sourceName ?? selectedSource?.name ?? '').toLocaleLowerCase().includes(sourceNameQuery.trim().toLocaleLowerCase())).map(entry => { const option = entry.options?.[0]; return <article className="catalog-source-item" key={entry.ref}><div><strong>{entry.sourceName ?? selectedSource?.name}</strong><p className="source-description">最新章节：{entry.latestChapter || '暂无信息'}</p></div><div className="sources-actions"><Button onClick={() => setDetail(entry)}>详情</Button><Button className="primary" disabled={option?.available === false} onClick={() => acquireEntry(entry, option?.id)}>{option?.label ?? '加入书架'}</Button></div></article>; })}
       </div>
     </Sheet>}
-    {detail && <SourceBookDetailSheet detail={detail} pending={detailQuery.isPending} error={detailQuery.error} acquiring={acquire.isPending} onAcquire={acquireEntry} onClose={() => setDetail(null)} />}
+    {detail && <SourceBookDetailSheet detail={detail} pending={detailQuery.isPending} error={detailQuery.error} acquiring={acquire.isPending} onAcquire={acquireEntry} {...(supportsEpub ? { onSaveEpub: (entry: SourceEntry) => void epub.save(entry), savingEpub: !!epub.savingRef } : {})} onClose={() => setDetail(null)} />}
   </div>;
 }

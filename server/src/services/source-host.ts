@@ -237,6 +237,19 @@ export class SourceHost {
     }, signal);
   }
 
+  /**
+   * Resolves an entry to its chapter publication *without* adding it to any
+   * shelf. Used by EPUB export, which must not have the side effect of acquire.
+   */
+  async chapterPublication(userId: string, id: string, entryRef: string, signal?: AbortSignal) {
+    return this.call(userId, id, async (provider, ctx) => {
+      const acquisition = await provider.acquire(ctx, { entryRef });
+      if (acquisition.kind !== 'chapters') throw badRequest('只有按章节提供的书源可以保存为 EPUB', 'SOURCE_UNSUPPORTED');
+      const entry = await provider.detail(ctx, entryRef);
+      return { entry, publicationRef: acquisition.publicationRef, sourceName: ctx.instance.name };
+    }, signal);
+  }
+
   refreshPublication(userId: string, bookId: string, signal?: AbortSignal) {
     return this.updates.check(userId, bookId, signal);
   }

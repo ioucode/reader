@@ -9,6 +9,7 @@ import { searchResponse } from '../search-stream.ts';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { PluginInstaller, PLUGIN_UPLOAD_LIMIT } from '../../sources/plugin-installer.ts';
+import { EpubExportService, exportDir, inside, type EpubExportJob } from '../../services/epub-export.ts';
 
 function textBody(body: unknown, name: string): string {
   const value = (body as Record<string, unknown> | null)?.[name];
@@ -41,6 +42,29 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
   const installer = new PluginInstaller(ctx.config.dataDir, host.plugins);
   app.addHook('onReady', async () => { await host.plugins.loadInstalled(); host.updates.start(); host.plugins.startTasks(); });
   app.addHook('onClose', async () => { await host.updates.stop(); await host.plugins.close(); });
+
+  // 「保存 EPUB」: archive a chapter source entry as an EPUB outside the library, never onto a shelf.
+  const exportsDir = exportDir(ctx.config);
+  const exportsInsideLibrary = inside(ctx.config.booksDir, exportsDir); // 实际写入前还会按真实路径再查一次
+  if (exportsInsideLibrary) app.log.warn({ exportsDir }, 'EPUB_EXPORT_DIR is inside BOOKS_DIR; EPUB export disabled');
+  const epubExports = new EpubExportService(host, exportsDir, ctx.config.booksDir, app.log);
+  app.addHook('onClose', async () => { epubExports.close(); });
+  const exportView = (job: EpubExportJob) => ({
+    id: job.id, sourceId: job.sourceId, entryRef: job.entryRef, title: job.title, state: job.state,
+    done: job.done, total: job.total, ...(job.file ? { file: job.file } : {}), ...(job.error ? { error: job.error } : {}),
+  });
+  app.post('/api/v1/sources/:id/epub-exports', { preHandler: auth }, async (request, reply) => {
+    requireAdmin(request);
+    if (exportsInsideLibrary) throw badRequest('EPUB 保存目录配置错误(不能在书库目录里)', 'EXPORT_DISABLED');
+    const { id } = request.params as { id: string };
+    const job = epubExports.start(currentUser(request).id, id, textBody(request.body, 'entryRef'));
+    reply.status(202);
+    return { job: exportView(job) };
+  });
+  app.get('/api/v1/epub-exports/:jobId', { preHandler: auth }, async (request) => {
+    requireAdmin(request);
+    return { job: exportView(epubExports.get(currentUser(request).id, (request.params as { jobId: string }).jobId)) };
+  });
 
   app.get('/api/v1/subscriptions', { preHandler: auth }, async (request) => ({ subscriptions: host.updates.list(currentUser(request).id) }));
   app.patch('/api/v1/books/:id/subscription', { preHandler: auth }, async (request) => {
