@@ -28,7 +28,8 @@ describe('epub export helpers', () => {
     assert.deepEqual(paragraphs('　　第一段\n\n　　第二段', 'text/plain; charset=utf-8'), ['第一段', '第二段']);
     assert.deepEqual(paragraphs('<p>一 &amp; 二</p><script>alert(1)</script><p>三<br>四</p>', 'text/html'), ['一 & 二', '三', '四']);
     assert.deepEqual(paragraphs('<p><img alt="a>b" src="reader-res:a">图注</p>', 'text/html'), ['（此处有插图，未保存到 EPUB）', '图注']);
-    assert.deepEqual(paragraphs('\u200b\ufeff\n正文\u200b', 'text/plain'), ['正文']);
+    // Invisible-only lines are dropped; visible lines are kept verbatim (joiners inside text survive).
+    assert.deepEqual(paragraphs('\u200b\ufeff\n正文\u200d字\n\u061c', 'text/plain'), ['正文\u200d字']);
   });
 
   test('privateAddress rejects internal ranges', () => {
@@ -75,7 +76,7 @@ describe('EpubExportService', () => {
       await until(() => job.state !== 'running');
       assert.equal(job.state, 'done', job.error);
       assert.equal(job.done, 2); assert.equal(job.total, 2);
-      assert.match(job.file ?? '', /^某书源\/测试书 \[[0-9a-f]{8}\]\.epub$/);
+      assert.match(job.file ?? '', /^某书源\/测试书 \[[0-9a-f]{32}\]\.epub$/);
       assert.deepEqual(await readdir(join(dir, '某书源')), [job.file!.split('/')[1]]);
       const zip = await JSZip.loadAsync(await readFile(join(dir, job.file!)));
       assert.match(await zip.file('OEBPS/c00001.xhtml')!.async('string'), /<h2>一<\/h2><p>正文 r1<\/p>/);
@@ -135,6 +136,7 @@ describe('EpubExportService', () => {
       ['text/plain', { mediaType: 'image/png', text: 'x' }, /文本章节/],
       ['text/html', { mediaType: 'text/plain', text: '<p>声明是 HTML,实际是纯文本</p>' }, /文本章节/],
       ['text/plain', { mediaType: 'text/plain', text: '\u0000\u0001\u202e' }, /没有可读文字/],
+      ['text/plain', { mediaType: 'text/plain', text: '\u061c\u3000' }, /没有可读文字/],
     ] as const) {
       const { root, dir, books } = await fixture();
       try {

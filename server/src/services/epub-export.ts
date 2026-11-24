@@ -221,8 +221,10 @@ async function readText(resource: ResourceResponse, title: string): Promise<stri
   catch { throw badRequest(`「${title}」不是有效的 UTF-8 文本,已停止保存`, 'UNSUPPORTED_FORMAT'); }
 }
 
-// Zero-width, bidi and XML-forbidden control characters: a line of only these is not readable text.
-const INVISIBLE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u206f\ufeff\ufffe\uffff\u00ad]/g;
+// Controls, format characters (zero-width, soft hyphen…), every bidi control, separators and
+// noncharacters. Used only to decide whether a line has visible text — never to rewrite the text,
+// so legitimate joiners inside emoji or scripts survive.
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Bidi_Control}\p{Zl}\p{Zp}\p{Zs}\ufffd\ufffe\uffff]/gu;
 const BLOCK = new Set(['p', 'div', 'br', 'li', 'section', 'article', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'tr', 'pre']);
 const SKIPPED = new Set(['script', 'style', 'textarea', 'noscript', 'title', 'template']);
 
@@ -251,7 +253,7 @@ export function paragraphs(text: string, mediaType: string): string[] {
     parser.end(text);
     plain = parts.join('');
   }
-  return plain.split(/\n+|　　/).map((line) => line.replace(INVISIBLE, '').replace(/^[\s　]+/, '').trim()).filter((line) => line && !/^\ufffd+$/.test(line));
+  return plain.split(/\n+|　　/).map((line) => line.replace(/^[\s　]+/, '').trim()).filter((line) => line.replace(INVISIBLE, '') !== '');
 }
 
 const xml = (value: string) => value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]!))
