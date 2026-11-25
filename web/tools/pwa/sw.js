@@ -50,12 +50,20 @@ self.addEventListener('fetch', (event) => {
     // error or no answer within 4 s also uses the cached shell.
     if (isHome) {
       const cached = await cache.match(shell);
-      const network = fetch(request).then((response) => response, () => null);
+      let useCache = false;
+      const network = fetch(request).then((response) => {
+        // Arrived after the cached shell was chosen: drop the body instead of downloading it.
+        if (useCache) void response.body?.cancel().catch(() => {});
+        return response;
+      }, () => null);
+      if (!cached) return (await network) ?? fetch(request);
       const slow = new Promise((resolve) => setTimeout(() => resolve(undefined), 4000));
       const response = await Promise.race([network, slow]);
-      if (!cached) return (await network) ?? fetch(request);
-      // opaqueredirect has status 0.
-      if (response && (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 500))) return response;
+      // Only the gateway's login flow goes to the browser: a redirect (opaqueredirect has
+      // status 0) or 401/403. Rate limits, other errors and timeouts keep the cached shell.
+      if (response && (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)
+        || response.status === 401 || response.status === 403)) return response;
+      useCache = true;
       void response?.body?.cancel().catch(() => {});
       return cached;
     }
