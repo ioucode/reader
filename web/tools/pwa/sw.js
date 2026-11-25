@@ -39,23 +39,25 @@ self.addEventListener('fetch', (event) => {
   if (!isHome && !urls.includes(key)) return;
   event.respondWith((async () => {
     const cache = await caches.open(cacheName);
-    // Opening the app is network-first. A cache-first shell never reaches the server, so
-    // a gateway in front of it (e.g. an SSO proxy) never gets to send an expired session
-    // to its login page; the page keeps working off /api while every update check (sw.js
-    // and the precache, both behind that gateway) silently fails, pinning the old version.
-    // Any response is used as is, including a redirect to a login page; only a network
-    // failure, a slow network or a server error falls back to the cached shell.
+    // Opening the app checks in with the server first. A shell served straight from cache
+    // never reaches the server, so a gateway in front of it (e.g. an SSO proxy) never gets
+    // to send an expired session to its login page; the page keeps working off /api while
+    // every update check (sw.js and the precache, both behind that gateway) silently fails,
+    // pinning the old version. So: a redirect or client error (the gateway's login flow) is
+    // handed to the browser; a successful response only proves the session and is dropped
+    // in favour of this worker's cached shell, which keeps the HTML on the same release as
+    // the cached assets until the reader accepts an update. A network failure, a server
+    // error or no answer within 4 s also uses the cached shell.
     if (isHome) {
-      const network = fetch(request).then(
-        (response) => (response.status < 500 ? response : null), // opaqueredirect has status 0
-        () => null,
-      );
-      const slow = new Promise((resolve) => setTimeout(() => resolve(undefined), 4000));
-      const first = await Promise.race([network, slow]);
-      if (first) return first;
       const cached = await cache.match(shell);
-      if (cached) return cached;
-      return (await network) ?? fetch(request);
+      const network = fetch(request).then((response) => response, () => null);
+      const slow = new Promise((resolve) => setTimeout(() => resolve(undefined), 4000));
+      const response = await Promise.race([network, slow]);
+      if (!cached) return (await network) ?? fetch(request);
+      // opaqueredirect has status 0.
+      if (response && (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 500))) return response;
+      void response?.body?.cancel().catch(() => {});
+      return cached;
     }
     // The manifest is network-first: Chrome re-reads it to update an installed app
     // (orientation, icons, colours), and a cache-first copy would pin every install to
