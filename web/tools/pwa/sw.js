@@ -39,6 +39,34 @@ self.addEventListener('fetch', (event) => {
   if (!isHome && !urls.includes(key)) return;
   event.respondWith((async () => {
     const cache = await caches.open(cacheName);
+    // Opening the app checks in with the server first. A shell served straight from cache
+    // never reaches the server, so a gateway in front of it (e.g. an SSO proxy) never gets
+    // to send an expired session to its login page; the page keeps working off /api while
+    // every update check (sw.js and the precache, both behind that gateway) silently fails,
+    // pinning the old version. So: a redirect or client error (the gateway's login flow) is
+    // handed to the browser; a successful response only proves the session and is dropped
+    // in favour of this worker's cached shell, which keeps the HTML on the same release as
+    // the cached assets until the reader accepts an update. A network failure, a server
+    // error or no answer within 4 s also uses the cached shell.
+    if (isHome) {
+      const cached = await cache.match(shell);
+      let useCache = false;
+      const network = fetch(request).then((response) => {
+        // Arrived after the cached shell was chosen: drop the body instead of downloading it.
+        if (useCache) void response.body?.cancel().catch(() => {});
+        return response;
+      }, () => null);
+      if (!cached) return (await network) ?? fetch(request);
+      const slow = new Promise((resolve) => setTimeout(() => resolve(undefined), 4000));
+      const response = await Promise.race([network, slow]);
+      // Only the gateway's login flow goes to the browser: a redirect (opaqueredirect has
+      // status 0) or 401/403. Rate limits, other errors and timeouts keep the cached shell.
+      if (response && (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)
+        || response.status === 401 || response.status === 403)) return response;
+      useCache = true;
+      void response?.body?.cancel().catch(() => {});
+      return cached;
+    }
     // The manifest is network-first: Chrome re-reads it to update an installed app
     // (orientation, icons, colours), and a cache-first copy would pin every install to
     // the manifest it first cached until the reader happened to accept an update.
