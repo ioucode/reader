@@ -3988,7 +3988,8 @@ svg.icon { display: inline-block; width: 1em; height: 1em; flex-shrink: 0; verti
 @media (min-width: 600px) {
   .catalog-source-item { display: flex; align-items: center; gap: 1rem; }
   .catalog-source-item > div:first-child { flex: 1; min-width: 0; }
-  .catalog-source-item .sources-actions { flex: none; }
+  /* Exactly 600px also matches the phone rule that makes actions full width; keep them sized to content here. */
+  .catalog-source-item .sources-actions { flex: none; width: auto; }
   .catalog-source-item .source-description { margin-bottom: 0; }
 }
 .source-default-badge { display: inline-block; margin-inline-start: .6rem; padding: .12rem .45rem; border-radius: var(--radius-xs); background: color-mix(in srgb, var(--reader-accent) 10%, transparent); color: var(--reader-accent); font-size: var(--text-meta); font-weight: 500; vertical-align: middle; }
