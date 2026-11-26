@@ -69,8 +69,8 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
 
   // Source result covers, fetched by the server; only links the server itself signed (SourceCovers).
   app.get('/api/v1/source-covers', { preHandler: auth }, async (request, reply) => {
-    const q = request.query as { u?: unknown; s?: unknown };
-    const image = await withSignal(request, reply, (signal) => host.covers.load(q.u, q.s, signal));
+    const q = request.query as { t?: unknown };
+    const image = await withSignal(request, reply, (signal) => host.covers.load(q.t, signal));
     if (!image) throw notFound('cover unavailable', 'COVER_UNAVAILABLE');
     reply.header('cache-control', 'private, max-age=86400').header('x-content-type-options', 'nosniff')
       .header('content-security-policy', "default-src 'none'; sandbox").type(image.mediaType);

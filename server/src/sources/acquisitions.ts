@@ -208,8 +208,18 @@ export class FileAcquisitions {
    */
   async importExported(
     source: { id: string; pluginId: string }, userId: string, entryRef: string, bytes: Uint8Array, entry: CatalogEntry,
+    contentDigest?: string,
   ): Promise<string> {
     if (!bytes.byteLength || bytes.byteLength > this.maxBytes) throw tooLarge();
+    // Same text as the current export (only e.g. the cover differs): keep that copy, with its
+    // progress and notes, rather than replacing it with an unread one.
+    if (contentDigest) {
+      const current = await this.previousExport(source.id, userId, entryRef).catch(() => undefined);
+      if (current?.contentDigest === contentDigest) {
+        this.showExport(userId, current.bookId, Date.now());
+        return current.bookId;
+      }
+    }
     const handler = fileHandlerForExtension('epub');
     if (!handler) throw badRequest('unsupported acquisition media type', 'UNSUPPORTED_FORMAT');
     await mkdir(join(this.config.dataDir, 'acquired'), { recursive: true });
@@ -273,15 +283,7 @@ export class FileAcquisitions {
              ON CONFLICT(user_id, book_id) DO UPDATE SET hidden = 0, added_at = excluded.added_at, reading_status = excluded.reading_status`,
             userId, bookId, now, status,
           );
-        } else {
-          // Same version again: only (re)show it; 最近入库 order moves only when it was not visible.
-          this.db.run(
-            `INSERT INTO user_books (user_id, book_id, added_at, hidden) VALUES (?, ?, ?, 0)
-             ON CONFLICT(user_id, book_id) DO UPDATE SET hidden = 0,
-             added_at = CASE WHEN user_books.hidden = 1 THEN excluded.added_at ELSE user_books.added_at END`,
-            userId, bookId, now,
-          );
-        }
+        } else this.showExport(userId, bookId, now);
       });
       keepFile = this.db.get<{ rel_path: string }>('SELECT rel_path FROM acquired_files WHERE book_id = ?', bookId)?.rel_path === relPath;
       keepCover = coverPath !== undefined && this.db.get<{ cover_path: string | null }>('SELECT cover_path FROM books WHERE id = ?', bookId)?.cover_path === coverPath;
@@ -294,23 +296,38 @@ export class FileAcquisitions {
   }
 
   /**
-   * The cover inside this user's current export of an entry, if any. Lets a
-   * re-export whose cover fetch failed this time reuse the same image, so
-   * unchanged text still produces the same file (and the same shelf book).
+   * This user's current export of a publication: its book, cover and text digest
+   * (`reader:content-digest` in the OPF). A re-export whose cover fetch fails
+   * reuses that cover, and one with the same text keeps that book.
    */
-  async previousExportCover(sourceId: string, userId: string, entryRef: string): Promise<{ bytes: Uint8Array; mediaType: string } | undefined> {
-    const row = this.db.get<{ rel_path: string }>(
-      `SELECT f.rel_path FROM source_acquisitions a JOIN acquired_files f ON f.book_id = a.book_id
+  async previousExport(sourceId: string, userId: string, publicationRef: string): Promise<{
+    bookId: string; cover?: { bytes: Uint8Array; mediaType: string }; contentDigest?: string;
+  } | undefined> {
+    const row = this.db.get<{ book_id: string; rel_path: string }>(
+      `SELECT a.book_id, f.rel_path FROM source_acquisitions a JOIN acquired_files f ON f.book_id = a.book_id
        WHERE a.source_id = ? AND a.user_id = ? AND a.entry_ref = ? AND a.option_id = ?`,
-      sourceId, userId, entryRef, EXPORT_OPTION,
+      sourceId, userId, publicationRef, EXPORT_OPTION,
     );
     if (!row) return undefined;
     const zip = await JSZip.loadAsync(await readFile(resolveInside(this.config.dataDir, row.rel_path)));
+    const opf = await zip.file('OEBPS/content.opf')?.async('string') ?? '';
+    const contentDigest = opf.match(/<meta name="reader:content-digest" content="([0-9a-f]{64})"\/>/)?.[1];
+    let cover: { bytes: Uint8Array; mediaType: string } | undefined;
     for (const [ext, mediaType] of [['jpg', 'image/jpeg'], ['png', 'image/png'], ['webp', 'image/webp'], ['gif', 'image/gif']] as const) {
       const file = zip.file(`OEBPS/cover.${ext}`);
-      if (file) return { bytes: await file.async('uint8array'), mediaType };
+      if (file) { cover = { bytes: await file.async('uint8array'), mediaType }; break; }
     }
-    return undefined;
+    return { bookId: row.book_id, ...(cover ? { cover } : {}), ...(contentDigest ? { contentDigest } : {}) };
+  }
+
+  /** (Re)show an export already on record; 最近入库 order moves only when it was not visible. */
+  private showExport(userId: string, bookId: string, now: number): void {
+    this.db.run(
+      `INSERT INTO user_books (user_id, book_id, added_at, hidden) VALUES (?, ?, ?, 0)
+       ON CONFLICT(user_id, book_id) DO UPDATE SET hidden = 0,
+       added_at = CASE WHEN user_books.hidden = 1 THEN excluded.added_at ELSE user_books.added_at END`,
+      userId, bookId, now,
+    );
   }
 
   private addToShelf(userId: string, bookId: string, now: number): void {

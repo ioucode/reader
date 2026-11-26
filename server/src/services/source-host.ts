@@ -218,13 +218,14 @@ export class SourceHost {
     return this.call(userId, id, (provider, ctx) => provider.detail(ctx, ref), signal);
   }
   /** 「保存 EPUB」: put a finished export on the exporting user's shelf (see FileAcquisitions.importExported). */
-  async importEpubExport(userId: string, sourceId: string, entryRef: string, bytes: Uint8Array, entry: CatalogEntry): Promise<string> {
+  /** Keyed by the resolved publicationRef (not the catalog entryRef alias), like the archive file name. */
+  async importEpubExport(userId: string, sourceId: string, publicationRef: string, bytes: Uint8Array, entry: CatalogEntry, contentDigest?: string): Promise<string> {
     const row = this.instance(sourceId);
-    return this.acquisitions.importExported({ id: row.id, pluginId: row.plugin_id }, userId, entryRef, bytes, entry);
+    return this.acquisitions.importExported({ id: row.id, pluginId: row.plugin_id }, userId, publicationRef, bytes, entry, contentDigest);
   }
 
-  previousExportCover(userId: string, sourceId: string, entryRef: string) {
-    return this.acquisitions.previousExportCover(sourceId, userId, entryRef);
+  previousEpubExport(userId: string, sourceId: string, publicationRef: string) {
+    return this.acquisitions.previousExport(sourceId, userId, publicationRef);
   }
 
   async acquire(userId: string, id: string, entryRef: string, optionId?: string, signal?: AbortSignal) {

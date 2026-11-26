@@ -263,11 +263,19 @@ describe('FileAcquisitions', () => {
       assert.ok(db.get('SELECT 1 FROM source_acquisitions WHERE user_id = ? AND book_id = ?', 'u1', firstId));
       assert.equal(db.get<{ book_id: string }>('SELECT book_id FROM source_acquisitions WHERE option_id = ?', EXPORT_OPTION)?.book_id, secondId);
       // The current export's cover can be reused by a later export whose cover fetch fails.
-      assert.equal(await importer.previousExportCover('s1', 'u1', 'entry-1'), undefined);
+      assert.equal((await importer.previousExport('s1', 'u1', 'entry-1'))?.cover, undefined);
       const covered = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }], { bytes: new Uint8Array([7, 8]), mediaType: 'image/png' }, options);
       const coveredId = await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', covered, entry);
-      assert.deepEqual(await importer.previousExportCover('s1', 'u1', 'entry-1'), { bytes: new Uint8Array([7, 8]), mediaType: 'image/png' });
+      assert.deepEqual((await importer.previousExport('s1', 'u1', 'entry-1'))?.cover, { bytes: new Uint8Array([7, 8]), mediaType: 'image/png' });
       assert.equal(db.get<{ reading_status: string | null }>('SELECT reading_status FROM user_books WHERE user_id = ? AND book_id = ?', 'u1', coveredId)?.reading_status, 'want');
+      // With a text digest: same text, different cover keeps the current copy instead of replacing it.
+      const digest = 'a'.repeat(64);
+      const textOnly = await buildEpub(entry, [{ title: '第1章', paragraphs: ['三'] }], undefined, { ...options, contentDigest: digest });
+      const textId = await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', textOnly, entry, digest);
+      assert.equal((await importer.previousExport('s1', 'u1', 'entry-1'))?.contentDigest, digest);
+      const withCover = await buildEpub(entry, [{ title: '第1章', paragraphs: ['三'] }], { bytes: new Uint8Array([9]), mediaType: 'image/png' }, { ...options, contentDigest: digest });
+      assert.equal(await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', withCover, entry, digest), textId);
+      assert.equal(db.get<{ hidden: number }>('SELECT hidden FROM user_books WHERE user_id = ? AND book_id = ?', 'u1', textId)?.hidden, 0);
       assert.deepEqual((await readdir(join(root, 'acquired'))).filter(name => name.endsWith('.part')), []);
     } finally {
       db.close();

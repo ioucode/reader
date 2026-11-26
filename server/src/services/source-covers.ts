@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHmac } from 'node:crypto';
 import { AppError, badRequest } from '../lib/errors.ts';
 import { fetchableImageUrl, fetchRemoteImage, type RemoteImage } from '../lib/remote-image.ts';
 import type { CatalogEntry, CatalogPage } from '../sources/types.ts';
@@ -9,10 +9,13 @@ import type { CatalogEntry, CatalogPage } from '../sources/types.ts';
  * A source entry's `coverUrl` points at the source's own site. The browser does
  * not load it directly: that would hand the user's address to every source and
  * break on hotlink protection. Instead each entry the server returns carries a
- * `coverProxyUrl` — `/api/v1/source-covers?u=<url>&s=<signature>` — and the
- * proxy only fetches URLs carrying a signature this server issued, so it is not
- * an open proxy: it can only reach images some source already returned, and
- * still only public http(s) addresses (see lib/remote-image.ts).
+ * `coverProxyUrl` — `/api/v1/source-covers?t=<token>`, where the token is the
+ * upstream URL sealed with AES-GCM under a server key. The proxy only fetches
+ * URLs inside a token this server issued, so it is not an open proxy: it can
+ * only reach images some source already returned, and still only public http(s)
+ * addresses (see lib/remote-image.ts). Sealing (not just signing) keeps upstream
+ * URLs — which may carry the source's own signed query tokens — out of request
+ * logs.
  *
  * Fetches are capped at a few at a time (a result page of 50 must not become 50
  * simultaneous requests to one site) and recent images are kept in a small
@@ -32,6 +35,7 @@ interface Pending { promise: Promise<RemoteImage | undefined>; waiters: number; 
 
 export class SourceCovers {
   private readonly key: Buffer;
+  private readonly ivKey: Buffer;
   private readonly cache = new Map<string, { image?: RemoteImage; at: number }>();
   private cacheBytes = 0;
   private active = 0;
@@ -40,6 +44,7 @@ export class SourceCovers {
 
   constructor(secret: string, private readonly fetcher: typeof fetchRemoteImage = fetchRemoteImage) {
     this.key = createHmac('sha256', 'reader/source-covers/v1').update(secret).digest();
+    this.ivKey = createHmac('sha256', 'reader/source-covers/v1/iv').update(secret).digest();
   }
 
   /** The browser-facing path for a cover, or undefined when the URL is not something the proxy would fetch. */
@@ -49,8 +54,8 @@ export class SourceCovers {
       // Sign the normalized form: it is what gets encoded, sent back and fetched.
       const href = new URL(url).href;
       if (!fetchableImageUrl(href)) return undefined;
-      return `${PROXY_PATH}?u=${encodeURIComponent(href)}&s=${this.sign(href)}`;
-    } catch { return undefined; } // e.g. a lone surrogate encodeURIComponent refuses
+      return `${PROXY_PATH}?t=${this.seal(href)}`;
+    } catch { return undefined; }
   }
 
   /**
@@ -69,10 +74,9 @@ export class SourceCovers {
   }
 
   /** Verified fetch; undefined means "no image" (the route answers 404). */
-  async load(url: unknown, signature: unknown, signal: AbortSignal): Promise<RemoteImage | undefined> {
-    if (typeof url !== 'string' || typeof signature !== 'string' || !this.verify(url, signature)) {
-      throw new AppError(403, 'COVER_SIGNATURE', 'invalid cover link');
-    }
+  async load(token: unknown, signal: AbortSignal): Promise<RemoteImage | undefined> {
+    const url = typeof token === 'string' ? this.open(token) : undefined;
+    if (!url) throw new AppError(403, 'COVER_SIGNATURE', 'invalid cover link');
     if (!fetchableImageUrl(url)) throw badRequest('invalid cover link', 'COVER_URL');
     const cached = this.cache.get(url);
     if (cached && Date.now() - cached.at < (cached.image ? CACHE_SUCCESS_MS : CACHE_FAILURE_MS)) {
@@ -148,14 +152,25 @@ export class SourceCovers {
     this.queue.shift()?.start();
   }
 
-  private sign(url: string): string {
-    return createHmac('sha256', this.key).update(url).digest('base64url').slice(0, 32);
+  private seal(url: string): string {
+    // Deterministic per URL (SIV-style): one cover keeps one link, so browser caching works;
+    // equal tokens reveal only that two links are the same cover.
+    const iv = createHmac('sha256', this.ivKey).update(url).digest().subarray(0, 12);
+    const cipher = createCipheriv('aes-256-gcm', this.key, iv);
+    const body = Buffer.concat([cipher.update(url, 'utf8'), cipher.final()]);
+    return Buffer.concat([iv, body, cipher.getAuthTag()]).toString('base64url');
   }
 
-  private verify(url: string, signature: string): boolean {
-    const expected = Buffer.from(this.sign(url));
-    const given = Buffer.from(signature);
-    return given.length === expected.length && timingSafeEqual(given, expected);
+  /** The sealed URL, or undefined for anything this server did not issue (GCM authenticates it). */
+  private open(token: string): string | undefined {
+    if (token.length > 4096) return undefined;
+    const raw = Buffer.from(token, 'base64url');
+    if (raw.length < 12 + 16 + 1) return undefined;
+    try {
+      const decipher = createDecipheriv('aes-256-gcm', this.key, raw.subarray(0, 12));
+      decipher.setAuthTag(raw.subarray(raw.length - 16));
+      return Buffer.concat([decipher.update(raw.subarray(12, raw.length - 16)), decipher.final()]).toString('utf8');
+    } catch { return undefined; }
   }
 }
 

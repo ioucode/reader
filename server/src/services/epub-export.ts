@@ -145,13 +145,15 @@ export class EpubExportService {
       chapters.push({ title: item.title, paragraphs: body });
       job.done++;
     }
-    // A failed cover fetch reuses the previous export's cover, so unchanged text stays the same book.
-    const cover = await fetchRemoteImage(entry.coverUrl, signal).catch(() => undefined)
-      ?? await Promise.resolve().then(() => this.host.previousExportCover(job.userId, job.sourceId, job.entryRef)).catch(() => undefined);
+    // Identifies the text alone; a re-export with the same text keeps the shelf copy (see importExported).
+    const contentDigest = createHash('sha256').update(JSON.stringify(chapters)).digest('hex');
+    // A failed cover fetch reuses the previous export's cover.
+    const previous = await Promise.resolve().then(() => this.host.previousEpubExport(job.userId, job.sourceId, publicationRef)).catch(() => undefined);
+    const cover = await fetchRemoteImage(entry.coverUrl, signal).catch(() => undefined) ?? previous?.cover;
     // Readable title + a stable digest of the source and publication, so distinct books never collide.
     const digest = createHash('sha256').update(`${job.sourceId}\0${publicationRef}`).digest('hex').slice(0, 32);
     // Deterministic bytes: the same content re-exported is the same shelf book (book id hashes the file).
-    const bytes = await buildEpub(entry, chapters, cover, { identifier: `urn:reader:epub-export:${digest}`, date: EXPORT_DATE });
+    const bytes = await buildEpub(entry, chapters, cover, { identifier: `urn:reader:epub-export:${digest}`, date: EXPORT_DATE, contentDigest });
 
     const { folder, archive } = await this.folder(safeName(sourceName || manifest.sourceName || job.sourceId));
     const target = join(folder, `${safeName(entry.title, MAX_NAME_BYTES - 45)} [${digest}].epub`);
@@ -164,7 +166,7 @@ export class EpubExportService {
     const file = relative(archive, target).split(sep).join('/');
     // The archive is the deliverable; a failed shelf import is reported, not a failed export.
     try {
-      const bookId = await this.host.importEpubExport(job.userId, job.sourceId, job.entryRef, bytes, entry);
+      const bookId = await this.host.importEpubExport(job.userId, job.sourceId, publicationRef, bytes, entry, contentDigest);
       return { file, bookId };
     } catch (error) {
       this.log?.warn({ sourceId: job.sourceId, code: error instanceof AppError ? error.code : 'IMPORT_FAILED' }, 'epub export shelf import failed');
@@ -288,7 +290,7 @@ const EXPORT_DATE = new Date('2020-01-01T00:00:00Z');
 
 export async function buildEpub(
   entry: CatalogEntry, chapters: Array<{ title: string; paragraphs: string[] }>, cover?: { bytes: Uint8Array; mediaType: string },
-  options: { identifier?: string; date?: Date } = {},
+  options: { identifier?: string; date?: Date; contentDigest?: string } = {},
 ): Promise<Uint8Array> {
   const identifier = options.identifier ?? `urn:uuid:${randomUUID()}`;
   const zip = new JSZip();
@@ -331,7 +333,8 @@ export async function buildEpub(
     + authors.map((author) => `<dc:creator>${xml(author)}</dc:creator>`).join('')
     + `<dc:language>${xml(entry.language || 'zh-CN')}</dc:language>`
     + (entry.description ? `<dc:description>${xml(entry.description)}</dc:description>` : '')
-    + `<meta property="dcterms:modified">${modified}</meta>${coverMeta}</metadata>`
+    + `<meta property="dcterms:modified">${modified}</meta>${coverMeta}`
+    + (options.contentDigest ? `<meta name="reader:content-digest" content="${xml(options.contentDigest)}"/>` : '') + '</metadata>'
     + `<manifest>${manifest.join('')}</manifest><spine>${spine.join('')}</spine></package>`);
   if (options.date) for (const file of Object.values(zip.files)) file.date = options.date;
   return zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE', compressionOptions: { level: 6 }, mimeType: 'application/epub+zip' });

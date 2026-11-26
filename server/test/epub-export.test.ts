@@ -67,7 +67,7 @@ describe('EpubExportService', () => {
     ] }),
     resource: async (_u: string, _s: string, _p: string, ref: string) => ({ mediaType: 'text/plain; charset=utf-8', text: `正文 ${ref}` }),
     importEpubExport: async () => 'book-1',
-    previousExportCover: async () => undefined,
+    previousEpubExport: async () => undefined,
     ...overrides,
   }) as unknown as SourceHost;
   const until = async (fn: () => boolean) => { for (let i = 0; i < 300 && !fn(); i++) await new Promise((r) => setTimeout(r, 10)); };
@@ -107,7 +107,8 @@ describe('EpubExportService', () => {
       const job = service.start('u1', 's1', 'e1');
       await until(() => job.state !== 'running');
       assert.equal(job.state, 'done', job.error);
-      assert.deepEqual(calls[0]!.slice(0, 3), ['u1', 's1', 'e1']);
+      assert.deepEqual(calls[0]!.slice(0, 3), ['u1', 's1', 'p1']); // keyed by publicationRef
+      assert.match(String(calls[0]![5]), /^[0-9a-f]{64}$/);
       assert.deepEqual(Buffer.from(calls[0]![3] as Uint8Array), await readFile(join(dir, job.file!)));
       assert.equal(job.bookId, 'book-9');
 
