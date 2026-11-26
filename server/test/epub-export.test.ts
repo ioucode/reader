@@ -47,6 +47,12 @@ describe('epub export helpers', () => {
     const opf = await zip.file('OEBPS/content.opf')!.async('string');
     assert.match(opf, /<dc:title>书 &lt;&amp;&gt;<\/dc:title>/);
     const chapter = await zip.file('OEBPS/c00001.xhtml')!.async('string');
+    // A cover is manifest-only, so the spine (reading positions) is the same with or without one.
+    const spine = async (bytes: Uint8Array) => (await (await JSZip.loadAsync(bytes)).file('OEBPS/content.opf')!.async('string')).match(/<spine>.*<\/spine>/)![0];
+    const withCover = await buildEpub({ ref: '1', title: 't' }, [{ title: 'c', paragraphs: ['p'] }], { bytes: new Uint8Array([1]), mediaType: 'image/png' });
+    const without = await buildEpub({ ref: '1', title: 't' }, [{ title: 'c', paragraphs: ['p'] }]);
+    assert.equal(await spine(withCover), await spine(without));
+    assert.match(await (await JSZip.loadAsync(withCover)).file('OEBPS/content.opf')!.async('string'), /properties="cover-image"/);
     assert.match(chapter, /<p>a &lt; b<\/p><p>控制字符<\/p>/);
   });
 });

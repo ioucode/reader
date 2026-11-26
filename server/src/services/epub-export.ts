@@ -300,9 +300,9 @@ export async function buildEpub(
   if (cover) {
     const ext = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' }[cover.mediaType] ?? 'img';
     zip.file(`OEBPS/cover.${ext}`, cover.bytes);
-    zip.file('OEBPS/cover.xhtml', xhtml('封面', `<div style="text-align:center"><img src="cover.${ext}" alt="封面"/></div>`));
-    manifest.push(`<item id="cover-image" href="cover.${ext}" media-type="${cover.mediaType}" properties="cover-image"/>`, '<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>');
-    spine.push('<itemref idref="cover" linear="no"/>');
+    // Manifest only, no spine page: the spine (and so every reading position in it) stays the
+    // same whether or not a cover could be fetched this time.
+    manifest.push(`<item id="cover-image" href="cover.${ext}" media-type="${cover.mediaType}" properties="cover-image"/>`);
     coverMeta = '<meta name="cover" content="cover-image"/>';
   }
   const authors = entry.authors?.filter(Boolean) ?? [];

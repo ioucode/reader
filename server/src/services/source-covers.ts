@@ -24,6 +24,8 @@ const MAX_CONCURRENT = 4;
 const MAX_PENDING = 64;
 const CACHE_BYTES = 32 * 1024 * 1024;
 const CACHE_FAILURE_MS = 10 * 60 * 1000;
+/** A source may replace the image behind a cover URL; refetch after this. */
+const CACHE_SUCCESS_MS = 6 * 60 * 60 * 1000;
 const PROXY_PATH = '/api/v1/source-covers';
 
 interface Pending { promise: Promise<RemoteImage | undefined>; waiters: number; controller: AbortController }
@@ -33,7 +35,7 @@ export class SourceCovers {
   private readonly cache = new Map<string, { image?: RemoteImage; at: number }>();
   private cacheBytes = 0;
   private active = 0;
-  private readonly queue: Array<() => void> = [];
+  private readonly queue: Array<{ start: () => void; signal: AbortSignal }> = [];
   private readonly pending = new Map<string, Pending>();
 
   constructor(secret: string, private readonly fetcher: typeof fetchRemoteImage = fetchRemoteImage) {
@@ -73,7 +75,7 @@ export class SourceCovers {
     }
     if (!fetchableImageUrl(url)) throw badRequest('invalid cover link', 'COVER_URL');
     const cached = this.cache.get(url);
-    if (cached && (cached.image || Date.now() - cached.at < CACHE_FAILURE_MS)) {
+    if (cached && Date.now() - cached.at < (cached.image ? CACHE_SUCCESS_MS : CACHE_FAILURE_MS)) {
       this.cache.delete(url); this.cache.set(url, cached); // LRU touch
       return cached.image;
     }
@@ -100,9 +102,9 @@ export class SourceCovers {
   }
 
   private async fetch(url: string, signal: AbortSignal): Promise<RemoteImage | undefined> {
-    await this.slot();
+    if (!await this.slot(signal)) return undefined; // abandoned while queued: never fetched, never cached
     try {
-      if (signal.aborted) return undefined; // nobody is waiting any more; do not fetch or cache
+      if (signal.aborted) return undefined;
       const image = await this.fetcher(url, AbortSignal.any([signal, AbortSignal.timeout(20_000)])).catch(() => undefined);
       if (!signal.aborted) this.remember(url, image);
       return image;
@@ -122,14 +124,28 @@ export class SourceCovers {
     }
   }
 
-  private slot(): Promise<void> {
-    if (this.active < MAX_CONCURRENT) { this.active++; return Promise.resolve(); }
-    return new Promise((resolve) => this.queue.push(() => { this.active++; resolve(); }));
+  /** Resolves true holding a fetch slot, or false (without one) if `signal` aborts while queued. */
+  private slot(signal: AbortSignal): Promise<boolean> {
+    if (signal.aborted) return Promise.resolve(false);
+    if (this.active < MAX_CONCURRENT) { this.active++; return Promise.resolve(true); }
+    return new Promise((resolve) => {
+      const waiter = {
+        signal,
+        start: () => { signal.removeEventListener('abort', onAbort); this.active++; resolve(true); },
+      };
+      const onAbort = () => {
+        const index = this.queue.indexOf(waiter);
+        if (index >= 0) this.queue.splice(index, 1);
+        resolve(false);
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.queue.push(waiter);
+    });
   }
 
   private release(): void {
     this.active--;
-    this.queue.shift()?.();
+    this.queue.shift()?.start();
   }
 
   private sign(url: string): string {

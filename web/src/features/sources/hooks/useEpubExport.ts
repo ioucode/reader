@@ -29,7 +29,8 @@ export function useEpubExport(sourceId: string) {
         job = await api.epubExport(job.id);
       }
       if (job.state === 'done' && job.bookId) {
-        await queryClient.invalidateQueries({ queryKey: ['shelf'] });
+        // A re-export can replace an earlier copy: refresh every list that may show it.
+        await Promise.all([queryClient.invalidateQueries({ queryKey: ['shelf'] }), queryClient.invalidateQueries({ queryKey: ['home', 'reading'] })]);
         notify(`已保存 EPUB 并加入书架：《${job.title || entry.title}》`, { kind: 'success' }, notice);
       } else if (job.state === 'done') notify(`已保存 EPUB：${job.file ?? job.title}(加入书架失败：${job.shelfError || '未知原因'})`, { kind: 'error' }, notice);
       else notify(job.error || '保存 EPUB 失败', { kind: 'error' }, notice);

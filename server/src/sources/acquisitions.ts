@@ -258,6 +258,14 @@ export class FileAcquisitions {
             source.id, userId, entryRef, `${EXPORT_OPTION}@${previous}`, previous,
           );
           this.db.run('UPDATE user_books SET hidden = 1 WHERE user_id = ? AND book_id = ?', userId, previous);
+          // Carry the reading position over: the export's spine is stable (same chapter files,
+          // new ones appended), so the old locator still points at the same place. Stamped now so
+          // incremental sync delivers it. Notes stay with the old version, which remains restorable.
+          this.db.run(
+            `INSERT OR IGNORE INTO reading_progress (user_id, book_id, locator, percentage, chapter_title, device, updated_at)
+             SELECT user_id, ?, locator, percentage, chapter_title, device, ? FROM reading_progress WHERE user_id = ? AND book_id = ?`,
+            bookId, now, userId, previous,
+          );
         }
         this.db.run(
           `INSERT INTO user_books (user_id, book_id, added_at, hidden) VALUES (?, ?, ?, 0)

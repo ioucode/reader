@@ -64,9 +64,16 @@ describe('SourceCovers', () => {
     assert.equal(started.length, 4);
     for (const caller of callers.slice(4)) caller.controller.abort();
     await Promise.all(callers.slice(4).map(caller => caller.done));
+    // Cancelled waiters left the queue at once, so the bound applies to live work only.
+    assert.equal((covers as unknown as { queue: unknown[] }).queue.length, 0);
+    const again = link(100);
+    const late = new AbortController();
+    const lateDone = covers.load(again.get('u'), again.get('s'), late.signal).catch(error => error);
+    late.abort(); await lateDone;
     release();
     await Promise.all(callers.slice(0, 4).map(caller => caller.done));
     await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(started.length, 4, 'abandoned covers were never fetched');
+    assert.equal((covers as unknown as { queue: unknown[] }).queue.length, 0, 'cancelled waiters leave the queue');
   });
 });

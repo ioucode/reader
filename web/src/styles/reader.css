@@ -3987,7 +3987,7 @@ svg.icon { display: inline-block; width: 1em; height: 1em; flex-shrink: 0; verti
 .alternative-preview select { width: 100%; min-width: 0; min-height: 44px; }
 
 .catalog-book:has(.catalog-source-count) { display: flex; align-items: center; gap: 1rem; }
-.catalog-book:has(.catalog-source-count) > div { flex: 1; min-width: 0; }
+.catalog-book:has(.catalog-source-count) > div:not(.source-cover) { flex: 1; min-width: 0; }
 .catalog-source-count { display: inline-flex; align-items: center; gap: .5rem; flex: none; min-height: 44px; white-space: nowrap; }
 .catalog-source-item { padding-block: 1rem; border-bottom: 1px solid var(--reader-line); }
 .catalog-source-item:last-child { border-bottom: 0; }
