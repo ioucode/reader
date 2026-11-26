@@ -145,7 +145,9 @@ export class EpubExportService {
       chapters.push({ title: item.title, paragraphs: body });
       job.done++;
     }
-    const cover = await fetchRemoteImage(entry.coverUrl, signal).catch(() => undefined);
+    // A failed cover fetch reuses the previous export's cover, so unchanged text stays the same book.
+    const cover = await fetchRemoteImage(entry.coverUrl, signal).catch(() => undefined)
+      ?? await Promise.resolve().then(() => this.host.previousExportCover(job.userId, job.sourceId, job.entryRef)).catch(() => undefined);
     // Readable title + a stable digest of the source and publication, so distinct books never collide.
     const digest = createHash('sha256').update(`${job.sourceId}\0${publicationRef}`).digest('hex').slice(0, 32);
     // Deterministic bytes: the same content re-exported is the same shelf book (book id hashes the file).

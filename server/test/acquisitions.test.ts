@@ -248,21 +248,24 @@ describe('FileAcquisitions', () => {
       assert.deepEqual(Buffer.from(rebuilt), Buffer.from(first));
       assert.equal(await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', rebuilt, entry), firstId);
 
-      db.run(`INSERT INTO reading_progress (user_id, book_id, locator, percentage, chapter_title, device, updated_at)
-              VALUES ('u1', ?, 'epubcfi(/6/2!/4/2)', 0.5, '第1章', 'web', 1)`, firstId);
+      db.run(`UPDATE user_books SET reading_status = 'want' WHERE user_id = 'u1' AND book_id = ?`, firstId);
       const second = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }, { title: '第2章', paragraphs: ['二'] }], undefined, options);
       const secondId = await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', second, entry);
       assert.notEqual(secondId, firstId);
       const shelf = db.all<{ book_id: string; hidden: number }>('SELECT book_id, hidden FROM user_books WHERE user_id = ? ORDER BY hidden', 'u1')
         .map(row => ({ book_id: row.book_id, hidden: row.hidden }));
       assert.deepEqual(shelf, [{ book_id: secondId, hidden: 0 }, { book_id: firstId, hidden: 1 }]);
-      // Reading position follows the new version (re-stamped so incremental sync sees it).
-      const progress = db.get<{ locator: string; updated_at: number }>('SELECT locator, updated_at FROM reading_progress WHERE user_id = ? AND book_id = ?', 'u1', secondId);
-      assert.equal(progress?.locator, 'epubcfi(/6/2!/4/2)');
-      assert.ok((progress?.updated_at ?? 0) > 1);
+      // A manual reading status follows the replacement.
+      assert.equal(db.get<{ reading_status: string | null }>('SELECT reading_status FROM user_books WHERE user_id = ? AND book_id = ?', 'u1', secondId)?.reading_status, 'want');
       // The superseded copy keeps its own ownership row, so it can be put back on the shelf.
       assert.ok(db.get('SELECT 1 FROM source_acquisitions WHERE user_id = ? AND book_id = ?', 'u1', firstId));
       assert.equal(db.get<{ book_id: string }>('SELECT book_id FROM source_acquisitions WHERE option_id = ?', EXPORT_OPTION)?.book_id, secondId);
+      // The current export's cover can be reused by a later export whose cover fetch fails.
+      assert.equal(await importer.previousExportCover('s1', 'u1', 'entry-1'), undefined);
+      const covered = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }], { bytes: new Uint8Array([7, 8]), mediaType: 'image/png' }, options);
+      const coveredId = await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', covered, entry);
+      assert.deepEqual(await importer.previousExportCover('s1', 'u1', 'entry-1'), { bytes: new Uint8Array([7, 8]), mediaType: 'image/png' });
+      assert.equal(db.get<{ reading_status: string | null }>('SELECT reading_status FROM user_books WHERE user_id = ? AND book_id = ?', 'u1', coveredId)?.reading_status, 'want');
       assert.deepEqual((await readdir(join(root, 'acquired'))).filter(name => name.endsWith('.part')), []);
     } finally {
       db.close();

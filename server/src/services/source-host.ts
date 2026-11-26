@@ -223,6 +223,10 @@ export class SourceHost {
     return this.acquisitions.importExported({ id: row.id, pluginId: row.plugin_id }, userId, entryRef, bytes, entry);
   }
 
+  previousExportCover(userId: string, sourceId: string, entryRef: string) {
+    return this.acquisitions.previousExportCover(sourceId, userId, entryRef);
+  }
+
   async acquire(userId: string, id: string, entryRef: string, optionId?: string, signal?: AbortSignal) {
     if (optionId?.startsWith(EXPORT_OPTION)) throw badRequest('invalid acquisition option', 'INVALID_ACQUISITION');
     return this.call(userId, id, async (provider, ctx) => {

@@ -67,6 +67,7 @@ describe('EpubExportService', () => {
     ] }),
     resource: async (_u: string, _s: string, _p: string, ref: string) => ({ mediaType: 'text/plain; charset=utf-8', text: `正文 ${ref}` }),
     importEpubExport: async () => 'book-1',
+    previousExportCover: async () => undefined,
     ...overrides,
   }) as unknown as SourceHost;
   const until = async (fn: () => boolean) => { for (let i = 0; i < 300 && !fn(); i++) await new Promise((r) => setTimeout(r, 10)); };

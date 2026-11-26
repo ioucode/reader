@@ -3,6 +3,7 @@ import { createWriteStream, existsSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, extname, join } from 'node:path';
 import { Readable, Transform } from 'node:stream';
+import JSZip from 'jszip';
 import { pipeline } from 'node:stream/promises';
 import type { AppConfig } from '../config/index.ts';
 import type { Db } from '../db/index.ts';
@@ -258,19 +259,19 @@ export class FileAcquisitions {
             source.id, userId, entryRef, `${EXPORT_OPTION}@${previous}`, previous,
           );
           this.db.run('UPDATE user_books SET hidden = 1 WHERE user_id = ? AND book_id = ?', userId, previous);
-          // Carry the reading position over: the export's spine is stable (same chapter files,
-          // new ones appended), so the old locator still points at the same place. Stamped now so
-          // incremental sync delivers it. Notes stay with the old version, which remains restorable.
-          this.db.run(
-            `INSERT OR IGNORE INTO reading_progress (user_id, book_id, locator, percentage, chapter_title, device, updated_at)
-             SELECT user_id, ?, locator, percentage, chapter_title, device, ? FROM reading_progress WHERE user_id = ? AND book_id = ?`,
-            bookId, now, userId, previous,
-          );
         }
+        // Reading progress and notes are not carried over: positions are tied to that file's
+        // chapter layout, which a changed source can shift. They stay with the old version,
+        // which remains restorable. A manual reading status (想读/在读/已读) is about the book,
+        // so it follows the replacement.
+        const status = previous && previous !== bookId
+          ? this.db.get<{ reading_status: string | null }>('SELECT reading_status FROM user_books WHERE user_id = ? AND book_id = ?', userId, previous)?.reading_status ?? null
+          : null;
         this.db.run(
-          `INSERT INTO user_books (user_id, book_id, added_at, hidden) VALUES (?, ?, ?, 0)
-           ON CONFLICT(user_id, book_id) DO UPDATE SET hidden = 0, added_at = excluded.added_at`,
-          userId, bookId, now,
+          `INSERT INTO user_books (user_id, book_id, added_at, hidden, reading_status) VALUES (?, ?, ?, 0, ?)
+           ON CONFLICT(user_id, book_id) DO UPDATE SET hidden = 0, added_at = excluded.added_at,
+           reading_status = COALESCE(user_books.reading_status, excluded.reading_status)`,
+          userId, bookId, now, status,
         );
       });
       keepFile = this.db.get<{ rel_path: string }>('SELECT rel_path FROM acquired_files WHERE book_id = ?', bookId)?.rel_path === relPath;
@@ -281,6 +282,26 @@ export class FileAcquisitions {
       if (finalPath && !keepFile) await rm(finalPath, { force: true });
       if (coverPath && !keepCover) await rm(resolveInside(this.config.dataDir, coverPath), { force: true });
     }
+  }
+
+  /**
+   * The cover inside this user's current export of an entry, if any. Lets a
+   * re-export whose cover fetch failed this time reuse the same image, so
+   * unchanged text still produces the same file (and the same shelf book).
+   */
+  async previousExportCover(sourceId: string, userId: string, entryRef: string): Promise<{ bytes: Uint8Array; mediaType: string } | undefined> {
+    const row = this.db.get<{ rel_path: string }>(
+      `SELECT f.rel_path FROM source_acquisitions a JOIN acquired_files f ON f.book_id = a.book_id
+       WHERE a.source_id = ? AND a.user_id = ? AND a.entry_ref = ? AND a.option_id = ?`,
+      sourceId, userId, entryRef, EXPORT_OPTION,
+    );
+    if (!row) return undefined;
+    const zip = await JSZip.loadAsync(await readFile(resolveInside(this.config.dataDir, row.rel_path)));
+    for (const [ext, mediaType] of [['jpg', 'image/jpeg'], ['png', 'image/png'], ['webp', 'image/webp'], ['gif', 'image/gif']] as const) {
+      const file = zip.file(`OEBPS/cover.${ext}`);
+      if (file) return { bytes: await file.async('uint8array'), mediaType };
+    }
+    return undefined;
   }
 
   private addToShelf(userId: string, bookId: string, now: number): void {

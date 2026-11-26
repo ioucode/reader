@@ -1,6 +1,6 @@
 import { lookup } from 'node:dns';
-import { request as httpRequest } from 'node:http';
-import { request as httpsRequest } from 'node:https';
+import { Agent as HttpAgent, request as httpRequest } from 'node:http';
+import { Agent as HttpsAgent, request as httpsRequest } from 'node:https';
 import { isIP, type LookupFunction } from 'node:net';
 
 /**
@@ -14,6 +14,10 @@ import { isIP, type LookupFunction } from 'node:net';
 export const IMAGE_TYPES: ReadonlySet<string> = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 export const MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024;
 const TIMEOUT_MS = 15_000;
+// Dedicated direct agents: an environment-configured proxy (NODE_USE_ENV_PROXY / global agent) would
+// resolve the destination itself, bypassing publicOnlyLookup.
+const directHttp = new HttpAgent();
+const directHttps = new HttpsAgent();
 
 export interface RemoteImage { bytes: Uint8Array; mediaType: string }
 
@@ -30,10 +34,11 @@ export function fetchableImageUrl(value: string | undefined): value is string {
 export function fetchRemoteImage(url: string | undefined, signal: AbortSignal, maxBytes = MAX_REMOTE_IMAGE_BYTES): Promise<RemoteImage | undefined> {
   if (!fetchableImageUrl(url)) return Promise.resolve(undefined);
   const parsed = new URL(url);
-  const request = parsed.protocol === 'https:' ? httpsRequest : httpRequest;
+  const https = parsed.protocol === 'https:';
+  const request = https ? httpsRequest : httpRequest;
   return new Promise((done, fail) => {
     const req = request(parsed, {
-      method: 'GET', lookup: publicOnlyLookup, signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]),
+      method: 'GET', agent: https ? directHttps : directHttp, lookup: publicOnlyLookup, signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]),
       headers: { accept: 'image/webp,image/png,image/jpeg,image/gif;q=0.9' },
     }, (response) => {
       const mediaType = String(response.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
