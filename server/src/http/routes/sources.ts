@@ -72,7 +72,8 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
     const q = request.query as { t?: unknown };
     const image = await withSignal(request, reply, (signal) => host.covers.load(q.t, currentUser(request).id, signal));
     if (!image) throw notFound('cover unavailable', 'COVER_UNAVAILABLE');
-    reply.header('cache-control', 'private, max-age=86400').header('x-content-type-options', 'nosniff')
+    // Vary by account: a browser must not serve one account's cached cover to another (the token is account-bound).
+    reply.header('cache-control', 'private, max-age=86400').header('vary', 'Authorization').header('x-content-type-options', 'nosniff')
       .header('content-security-policy', "default-src 'none'; sandbox").type(image.mediaType);
     return reply.send(Buffer.from(image.bytes));
   });

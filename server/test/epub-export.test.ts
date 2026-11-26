@@ -1,11 +1,12 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import JSZip from 'jszip';
 import { AppError } from '../src/lib/errors.ts';
-import { EpubExportService, buildEpub, inside, paragraphs, privateAddress, safeName } from '../src/services/epub-export.ts';
+import { EpubExportService, buildEpub, coverFromEpub, inside, paragraphs, privateAddress, safeName } from '../src/services/epub-export.ts';
+import { createHash } from 'node:crypto';
 import type { SourceHost } from '../src/services/source-host.ts';
 
 describe('epub export helpers', () => {
@@ -119,6 +120,21 @@ describe('EpubExportService', () => {
       assert.equal(again.bookId, undefined);
       assert.equal(again.shelfError, '书架写入失败');
       assert.ok(again.file);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test('a failed cover fetch keeps the cover of the archive being replaced', async () => {
+    const { root, dir, books } = await fixture();
+    try {
+      const digest = createHash('sha256').update('s1\0p1').digest('hex').slice(0, 32);
+      await mkdir(join(dir, '某书源'), { recursive: true });
+      await writeFile(join(dir, '某书源', `测试书 [${digest}].epub`),
+        await buildEpub({ ref: 'e1', title: '测试书' }, [{ title: '一', paragraphs: ['旧'] }], { bytes: new Uint8Array([5, 6]), mediaType: 'image/png' }));
+      const service = new EpubExportService(host(), dir, books);
+      const job = service.start('u1', 's1', 'e1');
+      await until(() => job.state !== 'running');
+      assert.equal(job.state, 'done', job.error);
+      assert.deepEqual(await coverFromEpub(await readFile(join(dir, job.file!))), { bytes: new Uint8Array([5, 6]), mediaType: 'image/png' });
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

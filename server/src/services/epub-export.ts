@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import JSZip from 'jszip';
 import { Parser } from 'htmlparser2';
@@ -149,16 +149,18 @@ export class EpubExportService {
     // the same content keeps the shelf copy (see importExported).
     const contentDigest = createHash('sha256')
       .update(JSON.stringify([entry.title, entry.authors ?? [], entry.description ?? '', entry.language ?? '', chapters])).digest('hex');
-    // A failed cover fetch reuses the previous export's cover.
-    const previous = await Promise.resolve().then(() => this.host.previousEpubExport(job.userId, job.sourceId, publicationRef)).catch(() => undefined);
-    const cover = await fetchRemoteImage(entry.coverUrl, signal).catch(() => undefined) ?? previous?.cover;
     // Readable title + a stable digest of the source and publication, so distinct books never collide.
     const digest = createHash('sha256').update(`${job.sourceId}\0${publicationRef}`).digest('hex').slice(0, 32);
+    const { folder, archive } = await this.folder(safeName(sourceName || manifest.sourceName || job.sourceId));
+    const target = join(folder, `${safeName(entry.title, MAX_NAME_BYTES - 45)} [${digest}].epub`);
+    // A failed cover fetch reuses the last archive's cover (falling back to the shelf copy's),
+    // so a transient failure does not strip a cover that was saved before.
+    const cover = await fetchRemoteImage(entry.coverUrl, signal).catch(() => undefined)
+      ?? await readFile(target).then(coverFromEpub).catch(() => undefined)
+      ?? (await Promise.resolve().then(() => this.host.previousEpubExport(job.userId, job.sourceId, publicationRef)).catch(() => undefined))?.cover;
     // Deterministic bytes: the same content re-exported is the same shelf book (book id hashes the file).
     const bytes = await buildEpub(entry, chapters, cover, { identifier: `urn:reader:epub-export:${digest}`, date: EXPORT_DATE, contentDigest });
 
-    const { folder, archive } = await this.folder(safeName(sourceName || manifest.sourceName || job.sourceId));
-    const target = join(folder, `${safeName(entry.title, MAX_NAME_BYTES - 45)} [${digest}].epub`);
     const temporary = join(folder, `.${randomUUID()}.part`);
     try {
       await writeFile(temporary, bytes);
@@ -340,6 +342,16 @@ export async function buildEpub(
     + `<manifest>${manifest.join('')}</manifest><spine>${spine.join('')}</spine></package>`);
   if (options.date) for (const file of Object.values(zip.files)) file.date = options.date;
   return zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE', compressionOptions: { level: 6 }, mimeType: 'application/epub+zip' });
+}
+
+/** The cover image buildEpub stored in an EPUB, if any. */
+export async function coverFromEpub(bytes: Uint8Array): Promise<{ bytes: Uint8Array; mediaType: string } | undefined> {
+  const zip = await JSZip.loadAsync(bytes);
+  for (const [ext, mediaType] of [['jpg', 'image/jpeg'], ['png', 'image/png'], ['webp', 'image/webp'], ['gif', 'image/gif']] as const) {
+    const file = zip.file(`OEBPS/cover.${ext}`);
+    if (file) return { bytes: await file.async('uint8array'), mediaType };
+  }
+  return undefined;
 }
 
 export function exportDir(config: { dataDir: string }): string {

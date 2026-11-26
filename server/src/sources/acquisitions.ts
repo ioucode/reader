@@ -24,6 +24,8 @@ export const MAX_ACQUISITION_BYTES = 256 * 1024 * 1024;
  */
 export const EXPORT_OPTION = 'reader.epub-export';
 type FileAcquisition = Extract<Acquisition, { kind: 'file' }>;
+/** Cover files buildEpub may write (OEBPS/cover.<ext>). */
+const COVER_TYPES = [['jpg', 'image/jpeg'], ['png', 'image/png'], ['webp', 'image/webp'], ['gif', 'image/gif']] as const;
 
 const EXTENSIONS: Readonly<Record<string, string>> = {
   'application/epub+zip': 'epub',
@@ -313,7 +315,7 @@ export class FileAcquisitions {
     const opf = await zip.file('OEBPS/content.opf')?.async('string') ?? '';
     const contentDigest = opf.match(/<meta name="reader:content-digest" content="([0-9a-f]{64})"\/>/)?.[1];
     let cover: { bytes: Uint8Array; mediaType: string } | undefined;
-    for (const [ext, mediaType] of [['jpg', 'image/jpeg'], ['png', 'image/png'], ['webp', 'image/webp'], ['gif', 'image/gif']] as const) {
+    for (const [ext, mediaType] of COVER_TYPES) {
       const file = zip.file(`OEBPS/cover.${ext}`);
       if (file) { cover = { bytes: await file.async('uint8array'), mediaType }; break; }
     }
