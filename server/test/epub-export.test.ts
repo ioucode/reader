@@ -33,8 +33,9 @@ describe('epub export helpers', () => {
   });
 
   test('privateAddress rejects internal ranges', () => {
-    for (const ip of ['10.0.0.1', '127.0.0.1', '172.16.3.4', '192.168.1.1', '169.254.1.1', '100.64.0.1', '::1', 'fd00::1', 'fe80::1', '::ffff:10.0.0.1', '::ffff:a00:1', '::ffff:7f00:1']) assert.equal(privateAddress(ip), true, ip);
-    for (const ip of ['1.1.1.1', '104.16.0.1', '2606:4700::1']) assert.equal(privateAddress(ip), false, ip);
+    for (const ip of ['10.0.0.1', '127.0.0.1', '172.16.3.4', '192.168.1.1', '169.254.1.1', '100.64.0.1', '::1', 'fd00::1', 'fe80::1', '::ffff:10.0.0.1', '::ffff:a00:1', '::ffff:7f00:1',
+      'fec0::1', '2001:db8::1', '2002:a00:1::1', '2001::1', '64:ff9b::a00:1', '100::1', '192.0.2.1', '203.0.113.9', '240.0.0.1', 'not-an-ip']) assert.equal(privateAddress(ip), true, ip);
+    for (const ip of ['1.1.1.1', '104.16.0.1', '2606:4700::1', '2400:cb00:2048:1::c629:d7a2']) assert.equal(privateAddress(ip), false, ip);
   });
 
   test('buildEpub writes a valid container with mimetype first and escaped text', async () => {

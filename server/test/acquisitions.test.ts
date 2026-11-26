@@ -231,7 +231,8 @@ describe('FileAcquisitions', () => {
     try {
       const importer = new FileAcquisitions(db, config);
       const entry = { ref: 'entry-1', title: '导出的书', authors: ['乙'] };
-      const first = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }], undefined, 'urn:reader:epub-export:abc');
+      const options = { identifier: 'urn:reader:epub-export:abc', date: new Date('2020-01-01T00:00:00Z') };
+      const first = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }], undefined, options);
       const firstId = await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', first, entry);
       const book = db.get<{ title: string; format: string }>('SELECT title, format FROM books WHERE id = ?', firstId);
       assert.equal(book?.title, '导出的书');
@@ -241,15 +242,21 @@ describe('FileAcquisitions', () => {
       assert.equal(db.get<{ hidden: number }>('SELECT hidden FROM user_books WHERE user_id = ? AND book_id = ?', 'u1', firstId)?.hidden, 0);
       assert.equal(db.get<{ option_id: string }>('SELECT option_id FROM source_acquisitions WHERE book_id = ?', firstId)?.option_id, EXPORT_OPTION);
 
-      // Identical bytes: same book, still one shelf row.
-      assert.equal(await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', first, entry), firstId);
+      // Same content built again later: identical bytes, same book, still one shelf row.
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      const rebuilt = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }], undefined, options);
+      assert.deepEqual(Buffer.from(rebuilt), Buffer.from(first));
+      assert.equal(await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', rebuilt, entry), firstId);
 
-      const second = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }, { title: '第2章', paragraphs: ['二'] }], undefined, 'urn:reader:epub-export:abc');
+      const second = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }, { title: '第2章', paragraphs: ['二'] }], undefined, options);
       const secondId = await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', second, entry);
       assert.notEqual(secondId, firstId);
       const shelf = db.all<{ book_id: string; hidden: number }>('SELECT book_id, hidden FROM user_books WHERE user_id = ? ORDER BY hidden', 'u1')
         .map(row => ({ book_id: row.book_id, hidden: row.hidden }));
       assert.deepEqual(shelf, [{ book_id: secondId, hidden: 0 }, { book_id: firstId, hidden: 1 }]);
+      // The superseded copy keeps its own ownership row, so it can be put back on the shelf.
+      assert.ok(db.get('SELECT 1 FROM source_acquisitions WHERE user_id = ? AND book_id = ?', 'u1', firstId));
+      assert.equal(db.get<{ book_id: string }>('SELECT book_id FROM source_acquisitions WHERE option_id = ?', EXPORT_OPTION)?.book_id, secondId);
       assert.deepEqual((await readdir(join(root, 'acquired'))).filter(name => name.endsWith('.part')), []);
     } finally {
       db.close();

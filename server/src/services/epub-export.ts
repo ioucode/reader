@@ -148,7 +148,8 @@ export class EpubExportService {
     const cover = await fetchRemoteImage(entry.coverUrl, signal).catch(() => undefined);
     // Readable title + a stable digest of the source and publication, so distinct books never collide.
     const digest = createHash('sha256').update(`${job.sourceId}\0${publicationRef}`).digest('hex').slice(0, 32);
-    const bytes = await buildEpub(entry, chapters, cover, `urn:reader:epub-export:${digest}`);
+    // Deterministic bytes: the same content re-exported is the same shelf book (book id hashes the file).
+    const bytes = await buildEpub(entry, chapters, cover, { identifier: `urn:reader:epub-export:${digest}`, date: EXPORT_DATE });
 
     const { folder, archive } = await this.folder(safeName(sourceName || manifest.sourceName || job.sourceId));
     const target = join(folder, `${safeName(entry.title, MAX_NAME_BYTES - 45)} [${digest}].epub`);
@@ -280,7 +281,14 @@ function xhtml(title: string, body: string): string {
     + `<body>${body}</body></html>`;
 }
 
-export async function buildEpub(entry: CatalogEntry, chapters: Array<{ title: string; paragraphs: string[] }>, cover?: { bytes: Uint8Array; mediaType: string }, identifier = `urn:uuid:${randomUUID()}`): Promise<Uint8Array> {
+/** Fixed timestamp for exports, so identical content always produces identical bytes. */
+const EXPORT_DATE = new Date('2020-01-01T00:00:00Z');
+
+export async function buildEpub(
+  entry: CatalogEntry, chapters: Array<{ title: string; paragraphs: string[] }>, cover?: { bytes: Uint8Array; mediaType: string },
+  options: { identifier?: string; date?: Date } = {},
+): Promise<Uint8Array> {
+  const identifier = options.identifier ?? `urn:uuid:${randomUUID()}`;
   const zip = new JSZip();
   zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
   zip.file('META-INF/container.xml', '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
@@ -313,7 +321,7 @@ export async function buildEpub(entry: CatalogEntry, chapters: Array<{ title: st
   });
   zip.file('OEBPS/nav.xhtml', '<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="zh-CN">'
     + `<head><meta charset="utf-8"/><title>目录</title></head><body><nav epub:type="toc" id="toc"><h1>目录</h1><ol>${toc.join('')}</ol></nav></body></html>`);
-  const modified = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const modified = (options.date ?? new Date()).toISOString().replace(/\.\d{3}Z$/, 'Z');
   zip.file('OEBPS/content.opf', '<?xml version="1.0" encoding="utf-8"?>'
     + '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="zh-CN">'
     + '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
@@ -323,6 +331,7 @@ export async function buildEpub(entry: CatalogEntry, chapters: Array<{ title: st
     + (entry.description ? `<dc:description>${xml(entry.description)}</dc:description>` : '')
     + `<meta property="dcterms:modified">${modified}</meta>${coverMeta}</metadata>`
     + `<manifest>${manifest.join('')}</manifest><spine>${spine.join('')}</spine></package>`);
+  if (options.date) for (const file of Object.values(zip.files)) file.date = options.date;
   return zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE', compressionOptions: { level: 6 }, mimeType: 'application/epub+zip' });
 }
 

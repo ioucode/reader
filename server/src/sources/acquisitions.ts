@@ -16,7 +16,11 @@ import type {
 } from './types.ts';
 
 export const MAX_ACQUISITION_BYTES = 256 * 1024 * 1024;
-/** Reserved `source_acquisitions.option_id` for 「保存 EPUB」 copies; SourceHost.acquire refuses it from clients. */
+/**
+ * Reserved `source_acquisitions.option_id` for 「保存 EPUB」 copies: EXPORT_OPTION points at the
+ * current export, `EXPORT_OPTION@<bookId>` keeps each superseded one owned. SourceHost.acquire
+ * refuses option ids in this namespace from clients.
+ */
 export const EXPORT_OPTION = 'reader.epub-export';
 type FileAcquisition = Extract<Acquisition, { kind: 'file' }>;
 
@@ -248,6 +252,11 @@ export class FileAcquisitions {
           source.id, userId, entryRef, EXPORT_OPTION, bookId,
         );
         if (previous && previous !== bookId) {
+          // Keep an ownership row per superseded version (restoring it to the shelf requires one).
+          this.db.run(
+            `INSERT OR IGNORE INTO source_acquisitions (source_id, user_id, entry_ref, option_id, book_id) VALUES (?, ?, ?, ?, ?)`,
+            source.id, userId, entryRef, `${EXPORT_OPTION}@${previous}`, previous,
+          );
           this.db.run('UPDATE user_books SET hidden = 1 WHERE user_id = ? AND book_id = ?', userId, previous);
         }
         this.db.run(

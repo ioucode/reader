@@ -34,17 +34,18 @@ export function fetchRemoteImage(url: string | undefined, signal: AbortSignal, m
   return new Promise((done, fail) => {
     const req = request(parsed, {
       method: 'GET', lookup: publicOnlyLookup, signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]),
-      headers: { accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.9' },
+      headers: { accept: 'image/webp,image/png,image/jpeg,image/gif;q=0.9' },
     }, (response) => {
       const mediaType = String(response.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
       const declared = Number(response.headers['content-length']);
       if (response.statusCode !== 200 || !IMAGE_TYPES.has(mediaType) || (Number.isFinite(declared) && declared > maxBytes)) {
-        response.resume(); done(undefined); return;
+        // Destroy rather than drain: a rejected body must not keep using bandwidth after the caller moved on.
+        response.destroy(); req.destroy(); done(undefined); return;
       }
       const chunks: Buffer[] = []; let size = 0;
       response.on('data', (chunk: Buffer) => {
         size += chunk.byteLength;
-        if (size > maxBytes) { req.destroy(); done(undefined); return; }
+        if (size > maxBytes) { response.destroy(); req.destroy(); done(undefined); return; }
         chunks.push(chunk);
       });
       response.on('end', () => done(size > maxBytes || size === 0 ? undefined : { bytes: Buffer.concat(chunks), mediaType }));
@@ -73,12 +74,21 @@ export const publicOnlyLookup: LookupFunction = (hostname, options, callback) =>
   });
 };
 
+/**
+ * True for anything that is not a globally routable unicast address. IPv4 is a
+ * denylist of the special-purpose ranges; IPv6 is an allowlist (2000::/3 global
+ * unicast only) minus documentation, 6to4 and Teredo, which can embed arbitrary
+ * IPv4 addresses.
+ */
 export function privateAddress(address: string): boolean {
   if (isIP(address) === 4) {
-    const [a = 0, b = 0] = address.split('.').map(Number);
+    const [a = 0, b = 0, c = 0] = address.split('.').map(Number);
     return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254)
-      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)) || a >= 224;
+      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19))
+      || (a === 192 && b === 0 && (c === 0 || c === 2)) || (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113)
+      || (a === 192 && b === 88 && c === 99) || a >= 224;
   }
+  if (isIP(address) !== 6) return true;
   const lower = address.toLowerCase();
   if (lower.startsWith('::ffff:')) {
     const rest = lower.slice(7);
@@ -87,5 +97,16 @@ export function privateAddress(address: string): boolean {
     if (hex) { const hi = parseInt(hex[1]!, 16), lo = parseInt(hex[2]!, 16); return privateAddress(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`); }
     return privateAddress(rest);
   }
-  return lower === '::' || lower === '::1' || /^f[cd]/.test(lower) || /^fe[89ab]/.test(lower) || lower.startsWith('ff');
+  const [first = 0, second = 0] = hextets(lower);
+  if (first < 0x2000 || first > 0x3fff) return true; // not global unicast (covers ::, ::1, fc00::/7, fe80::/10, fec0::/10, ff00::/8, 64:ff9b::/96…)
+  return first === 0x2002 || (first === 0x2001 && (second === 0 || second === 0xdb8)) || first === 0x3fff;
+}
+
+/** The first two 16-bit groups of an IPv6 address, expanding `::`. */
+function hextets(address: string): number[] {
+  const [head = '', tail] = address.split('::');
+  const left = head ? head.split(':') : [];
+  const right = tail === undefined ? [] : tail ? tail.split(':') : [];
+  const groups = tail === undefined ? left : [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right];
+  return groups.slice(0, 2).map((group) => parseInt(group, 16) || 0);
 }

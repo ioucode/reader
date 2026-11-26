@@ -13,6 +13,13 @@ describe('SourceCovers', () => {
     for (const coverUrl of [undefined, 'ftp://example.com/c.jpg', 'https://user:pw@example.com/c.jpg', 'http://127.0.0.1/c.jpg', 'http://[::1]/c.jpg', 'data:image/png;base64,AA']) {
       assert.equal(covers.entry({ ref: 'a', title: 't', ...(coverUrl ? { coverUrl } : {}) }).coverProxyUrl, undefined, coverUrl);
     }
+    // A plugin cannot choose the link the browser fetches with the user's credentials.
+    const forged = covers.entry({ ref: 'a', title: 't', coverProxyUrl: 'https://evil.example/steal' } as never) as { coverProxyUrl?: string };
+    assert.equal(forged.coverProxyUrl, undefined);
+    const replaced = covers.entry({ ref: 'a', title: 't', coverUrl: 'https://example.com/c.jpg', coverProxyUrl: 'https://evil.example/' } as never) as { coverProxyUrl?: string };
+    assert.match(replaced.coverProxyUrl ?? '', /^\/api\/v1\/source-covers\?/);
+    // Malformed (lone surrogate) is skipped, not thrown.
+    assert.equal(covers.proxyPath('https://example.com/\ud800.jpg')?.startsWith('/api/v1/source-covers?') ?? true, true);
     const page = covers.page({ items: [{ ref: 'a', title: 't', coverUrl: 'http://example.com/x.png' }] });
     assert.ok(page.items[0]!.coverProxyUrl);
     assert.equal(fetchableImageUrl('http://10.0.0.1/x.png'), false);
@@ -37,5 +44,29 @@ describe('SourceCovers', () => {
     const covers = new SourceCovers('secret', async () => { throw new Error('boom'); });
     const params = new URL(covers.proxyPath('https://example.com/c.jpg')!, 'http://x').searchParams;
     assert.equal(await covers.load(params.get('u'), params.get('s'), new AbortController().signal), undefined);
+  });
+
+  test('a cover nobody waits for any more is not fetched; too many pending covers answer busy', async () => {
+    const started: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const covers = new SourceCovers('secret', async (url, signal) => {
+      started.push(url);
+      await Promise.race([gate, new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))]);
+      return image;
+    });
+    const link = (n: number) => new URL(covers.proxyPath(`https://example.com/${n}.jpg`)!, 'http://x').searchParams;
+    const callers = Array.from({ length: 64 }, (_, n) => { const controller = new AbortController(); const p = link(n);
+      return { controller, done: covers.load(p.get('u'), p.get('s'), controller.signal).catch(error => error) }; });
+    const extra = link(99);
+    await assert.rejects(covers.load(extra.get('u'), extra.get('s'), new AbortController().signal), /too many covers/);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(started.length, 4);
+    for (const caller of callers.slice(4)) caller.controller.abort();
+    await Promise.all(callers.slice(4).map(caller => caller.done));
+    release();
+    await Promise.all(callers.slice(0, 4).map(caller => caller.done));
+    await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(started.length, 4, 'abandoned covers were never fetched');
   });
 });

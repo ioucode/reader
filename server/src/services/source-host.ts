@@ -224,7 +224,7 @@ export class SourceHost {
   }
 
   async acquire(userId: string, id: string, entryRef: string, optionId?: string, signal?: AbortSignal) {
-    if (optionId === EXPORT_OPTION) throw badRequest('invalid acquisition option', 'INVALID_ACQUISITION');
+    if (optionId?.startsWith(EXPORT_OPTION)) throw badRequest('invalid acquisition option', 'INVALID_ACQUISITION');
     return this.call(userId, id, async (provider, ctx) => {
       const acquisition = await provider.acquire(ctx, { entryRef, optionId });
       if (acquisition.kind === 'ready') {

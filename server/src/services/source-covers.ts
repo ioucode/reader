@@ -20,16 +20,21 @@ import type { CatalogEntry, CatalogPage } from '../sources/types.ts';
  */
 
 const MAX_CONCURRENT = 4;
+/** Distinct covers waiting or in flight; beyond this the proxy answers 503 instead of queueing. */
+const MAX_PENDING = 64;
 const CACHE_BYTES = 32 * 1024 * 1024;
 const CACHE_FAILURE_MS = 10 * 60 * 1000;
+const PROXY_PATH = '/api/v1/source-covers';
+
+interface Pending { promise: Promise<RemoteImage | undefined>; waiters: number; controller: AbortController }
 
 export class SourceCovers {
   private readonly key: Buffer;
   private readonly cache = new Map<string, { image?: RemoteImage; at: number }>();
   private cacheBytes = 0;
   private active = 0;
-  private readonly waiting: Array<() => void> = [];
-  private readonly pending = new Map<string, Promise<RemoteImage | undefined>>();
+  private readonly queue: Array<() => void> = [];
+  private readonly pending = new Map<string, Pending>();
 
   constructor(secret: string, private readonly fetcher: typeof fetchRemoteImage = fetchRemoteImage) {
     this.key = createHmac('sha256', 'reader/source-covers/v1').update(secret).digest();
@@ -38,12 +43,23 @@ export class SourceCovers {
   /** The browser-facing path for a cover, or undefined when the URL is not something the proxy would fetch. */
   proxyPath(url: string | undefined): string | undefined {
     if (!fetchableImageUrl(url)) return undefined;
-    return `/api/v1/source-covers?u=${encodeURIComponent(url)}&s=${this.sign(url)}`;
+    try {
+      // Sign the normalized form: it is what gets encoded, sent back and fetched.
+      const href = new URL(url).href;
+      if (!fetchableImageUrl(href)) return undefined;
+      return `${PROXY_PATH}?u=${encodeURIComponent(href)}&s=${this.sign(href)}`;
+    } catch { return undefined; } // e.g. a lone surrogate encodeURIComponent refuses
   }
 
+  /**
+   * The entry as the browser gets it. `coverProxyUrl` is always the server's own
+   * value: a plugin-supplied one is dropped, since the client fetches it with the
+   * user's credentials.
+   */
   entry<T extends CatalogEntry>(entry: T): T & { coverProxyUrl?: string } {
+    const { coverProxyUrl: _plugin, ...rest } = entry as T & { coverProxyUrl?: unknown };
     const path = this.proxyPath(entry.coverUrl);
-    return (path ? { ...entry, coverProxyUrl: path } : entry) as T & { coverProxyUrl?: string };
+    return (path ? { ...rest, coverProxyUrl: path } : rest) as T & { coverProxyUrl?: string };
   }
 
   page<T extends CatalogPage>(page: T): T {
@@ -61,20 +77,34 @@ export class SourceCovers {
       this.cache.delete(url); this.cache.set(url, cached); // LRU touch
       return cached.image;
     }
-    // Concurrent requests for one cover share a single upstream fetch, which is not tied to any one request.
+    // Concurrent requests for one cover share one upstream fetch; it is abandoned
+    // (dequeued or aborted) once no request is waiting for it any more.
     let shared = this.pending.get(url);
     if (!shared) {
-      shared = this.fetch(url).finally(() => this.pending.delete(url));
-      this.pending.set(url, shared);
+      if (this.pending.size >= MAX_PENDING) throw new AppError(503, 'COVER_BUSY', 'too many covers loading');
+      const controller = new AbortController();
+      const entry: Pending = { waiters: 0, controller, promise: Promise.resolve(undefined) };
+      entry.promise = this.fetch(url, controller.signal).finally(() => { if (this.pending.get(url) === entry) this.pending.delete(url); });
+      this.pending.set(url, entry);
+      shared = entry;
     }
-    return abortable(shared, signal);
+    const current = shared;
+    current.waiters++;
+    try { return await abortable(current.promise, signal); }
+    finally {
+      if (--current.waiters === 0 && this.pending.get(url) === current) {
+        current.controller.abort();
+        this.pending.delete(url);
+      }
+    }
   }
 
-  private async fetch(url: string): Promise<RemoteImage | undefined> {
+  private async fetch(url: string, signal: AbortSignal): Promise<RemoteImage | undefined> {
     await this.slot();
     try {
-      const image = await this.fetcher(url, AbortSignal.timeout(20_000)).catch(() => undefined);
-      this.remember(url, image);
+      if (signal.aborted) return undefined; // nobody is waiting any more; do not fetch or cache
+      const image = await this.fetcher(url, AbortSignal.any([signal, AbortSignal.timeout(20_000)])).catch(() => undefined);
+      if (!signal.aborted) this.remember(url, image);
       return image;
     } finally { this.release(); }
   }
@@ -94,12 +124,12 @@ export class SourceCovers {
 
   private slot(): Promise<void> {
     if (this.active < MAX_CONCURRENT) { this.active++; return Promise.resolve(); }
-    return new Promise((resolve) => this.waiting.push(() => { this.active++; resolve(); }));
+    return new Promise((resolve) => this.queue.push(() => { this.active++; resolve(); }));
   }
 
   private release(): void {
     this.active--;
-    this.waiting.shift()?.();
+    this.queue.shift()?.();
   }
 
   private sign(url: string): string {
