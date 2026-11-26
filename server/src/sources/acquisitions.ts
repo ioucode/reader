@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream, existsSync } from 'node:fs';
-import { mkdir, readFile, rename, rm } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, extname, join } from 'node:path';
 import { Readable, Transform } from 'node:stream';
+import JSZip from 'jszip';
 import { pipeline } from 'node:stream/promises';
 import type { AppConfig } from '../config/index.ts';
 import type { Db } from '../db/index.ts';
@@ -16,7 +17,15 @@ import type {
 } from './types.ts';
 
 export const MAX_ACQUISITION_BYTES = 256 * 1024 * 1024;
+/**
+ * Reserved `source_acquisitions.option_id` for 「保存 EPUB」 copies: EXPORT_OPTION points at the
+ * current export, `EXPORT_OPTION@<bookId>` keeps each superseded one owned. SourceHost.acquire
+ * refuses option ids in this namespace from clients.
+ */
+export const EXPORT_OPTION = 'reader.epub-export';
 type FileAcquisition = Extract<Acquisition, { kind: 'file' }>;
+/** Cover files buildEpub may write (OEBPS/cover.<ext>). */
+const COVER_TYPES = [['jpg', 'image/jpeg'], ['png', 'image/png'], ['webp', 'image/webp'], ['gif', 'image/gif']] as const;
 
 const EXTENSIONS: Readonly<Record<string, string>> = {
   'application/epub+zip': 'epub',
@@ -165,7 +174,7 @@ export class FileAcquisitions {
       signal.throwIfAborted();
       const now = Date.now();
       this.db.transaction(() => {
-        this.insertBook(bookId, parsed, contentHash, size, coverPath, entry, context, now);
+        this.insertBook(bookId, parsed, contentHash, size, coverPath, entry, context.instance.pluginId, now);
         const file = this.db.get<{ rel_path: string }>('SELECT rel_path FROM acquired_files WHERE book_id = ?', bookId);
         if (!file || !existsSync(resolveInside(this.config.dataDir, file.rel_path))) {
           this.db.run(
@@ -192,6 +201,137 @@ export class FileAcquisitions {
     }
   }
 
+  /**
+   * 「保存 EPUB」: an EPUB the server built itself becomes this user's acquired
+   * book, like a source download. It is recorded under the entry with the
+   * reserved option id EXPORT_OPTION, so a later export of the same entry
+   * replaces the earlier copy on the shelf (the old copy is hidden, not
+   * deleted: its progress and notes stay attached to it).
+   */
+  async importExported(
+    source: { id: string; pluginId: string }, userId: string, entryRef: string, bytes: Uint8Array, entry: CatalogEntry,
+    contentDigest?: string,
+  ): Promise<string> {
+    if (!bytes.byteLength || bytes.byteLength > this.maxBytes) throw tooLarge();
+    // Same text as the current export (only e.g. the cover differs): keep that copy, with its
+    // progress and notes, rather than replacing it with an unread one.
+    if (contentDigest) {
+      const current = await this.previousExport(source.id, userId, entryRef).catch(() => undefined);
+      if (current?.contentDigest === contentDigest) {
+        this.showExport(userId, current.bookId, Date.now());
+        return current.bookId;
+      }
+    }
+    const handler = fileHandlerForExtension('epub');
+    if (!handler) throw badRequest('unsupported acquisition media type', 'UNSUPPORTED_FORMAT');
+    await mkdir(join(this.config.dataDir, 'acquired'), { recursive: true });
+    const token = randomUUID();
+    const temporaryPath = resolveInside(this.config.dataDir, `acquired/${token}.part`);
+    let finalPath: string | undefined;
+    let coverPath: string | undefined;
+    let keepFile = false;
+    let keepCover = false;
+    try {
+      await writeFile(temporaryPath, bytes, { flag: 'wx' });
+      const buffer = Buffer.from(bytes);
+      const parsed = await handler.parse({ relPath: `${entry.title}.epub`, absPath: temporaryPath }, buffer);
+      if (parsed.metadata.raw.parseError) throw badRequest('exported EPUB could not be parsed', 'INVALID_RESOURCE');
+      const contentHash = createHash('sha256').update(buffer).digest('hex');
+      const bookId = computeBookId(parsed.metadata.identifier, contentHash);
+      const relPath = `acquired/${bookId}-${token}.epub`;
+      finalPath = resolveInside(this.config.dataDir, relPath);
+      await rename(temporaryPath, finalPath);
+      if (parsed.cover && !this.db.get('SELECT id FROM books WHERE id = ?', bookId)) {
+        coverPath = await saveCover(this.config.dataDir, `${bookId}-${token}`, parsed.cover);
+      }
+      const now = Date.now();
+      this.db.transaction(() => {
+        const previous = this.db.get<{ book_id: string }>(
+          'SELECT book_id FROM source_acquisitions WHERE source_id = ? AND user_id = ? AND entry_ref = ? AND option_id = ?',
+          source.id, userId, entryRef, EXPORT_OPTION,
+        )?.book_id;
+        this.insertBook(bookId, parsed, contentHash, buffer.byteLength, coverPath, entry, source.pluginId, now);
+        const file = this.db.get<{ rel_path: string }>('SELECT rel_path FROM acquired_files WHERE book_id = ?', bookId);
+        if (!file || !existsSync(resolveInside(this.config.dataDir, file.rel_path))) {
+          this.db.run(
+            `INSERT INTO acquired_files (book_id, rel_path, size) VALUES (?, ?, ?)
+             ON CONFLICT(book_id) DO UPDATE SET rel_path = excluded.rel_path, size = excluded.size`,
+            bookId, relPath, buffer.byteLength,
+          );
+        }
+        this.db.run(
+          `INSERT INTO source_acquisitions (source_id, user_id, entry_ref, option_id, book_id) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(source_id, user_id, entry_ref, option_id) DO UPDATE SET book_id = excluded.book_id`,
+          source.id, userId, entryRef, EXPORT_OPTION, bookId,
+        );
+        if (previous && previous !== bookId) {
+          // Keep an ownership row per superseded version (restoring it to the shelf requires one).
+          this.db.run(
+            `INSERT OR IGNORE INTO source_acquisitions (source_id, user_id, entry_ref, option_id, book_id) VALUES (?, ?, ?, ?, ?)`,
+            source.id, userId, entryRef, `${EXPORT_OPTION}@${previous}`, previous,
+          );
+          this.db.run('UPDATE user_books SET hidden = 1 WHERE user_id = ? AND book_id = ?', userId, previous);
+        }
+        // Reading progress and notes are not carried over: positions are tied to that file's
+        // chapter layout, which a changed source can shift. They stay with the old version,
+        // which remains restorable. A manual reading status (想读/在读/已读) is about the book,
+        // so it follows the replacement.
+        // (Copied verbatim, NULL included, from the outgoing version — it is the current one.)
+        if (previous && previous !== bookId) {
+          const status = this.db.get<{ reading_status: string | null }>(
+            'SELECT reading_status FROM user_books WHERE user_id = ? AND book_id = ?', userId, previous)?.reading_status ?? null;
+          this.db.run(
+            `INSERT INTO user_books (user_id, book_id, added_at, hidden, reading_status) VALUES (?, ?, ?, 0, ?)
+             ON CONFLICT(user_id, book_id) DO UPDATE SET hidden = 0, added_at = excluded.added_at, reading_status = excluded.reading_status`,
+            userId, bookId, now, status,
+          );
+        } else this.showExport(userId, bookId, now);
+      });
+      keepFile = this.db.get<{ rel_path: string }>('SELECT rel_path FROM acquired_files WHERE book_id = ?', bookId)?.rel_path === relPath;
+      keepCover = coverPath !== undefined && this.db.get<{ cover_path: string | null }>('SELECT cover_path FROM books WHERE id = ?', bookId)?.cover_path === coverPath;
+      return bookId;
+    } finally {
+      await rm(temporaryPath, { force: true });
+      if (finalPath && !keepFile) await rm(finalPath, { force: true });
+      if (coverPath && !keepCover) await rm(resolveInside(this.config.dataDir, coverPath), { force: true });
+    }
+  }
+
+  /**
+   * This user's current export of a publication: its book, cover and text digest
+   * (`reader:content-digest` in the OPF). A re-export whose cover fetch fails
+   * reuses that cover, and one with the same text keeps that book.
+   */
+  async previousExport(sourceId: string, userId: string, publicationRef: string): Promise<{
+    bookId: string; cover?: { bytes: Uint8Array; mediaType: string }; contentDigest?: string;
+  } | undefined> {
+    const row = this.db.get<{ book_id: string; rel_path: string }>(
+      `SELECT a.book_id, f.rel_path FROM source_acquisitions a JOIN acquired_files f ON f.book_id = a.book_id
+       WHERE a.source_id = ? AND a.user_id = ? AND a.entry_ref = ? AND a.option_id = ?`,
+      sourceId, userId, publicationRef, EXPORT_OPTION,
+    );
+    if (!row) return undefined;
+    const zip = await JSZip.loadAsync(await readFile(resolveInside(this.config.dataDir, row.rel_path)));
+    const opf = await zip.file('OEBPS/content.opf')?.async('string') ?? '';
+    const contentDigest = opf.match(/<meta name="reader:content-digest" content="([0-9a-f]{64})"\/>/)?.[1];
+    let cover: { bytes: Uint8Array; mediaType: string } | undefined;
+    for (const [ext, mediaType] of COVER_TYPES) {
+      const file = zip.file(`OEBPS/cover.${ext}`);
+      if (file) { cover = { bytes: await file.async('uint8array'), mediaType }; break; }
+    }
+    return { bookId: row.book_id, ...(cover ? { cover } : {}), ...(contentDigest ? { contentDigest } : {}) };
+  }
+
+  /** (Re)show an export already on record; 最近入库 order moves only when it was not visible. */
+  private showExport(userId: string, bookId: string, now: number): void {
+    this.db.run(
+      `INSERT INTO user_books (user_id, book_id, added_at, hidden) VALUES (?, ?, ?, 0)
+       ON CONFLICT(user_id, book_id) DO UPDATE SET hidden = 0,
+       added_at = CASE WHEN user_books.hidden = 1 THEN excluded.added_at ELSE user_books.added_at END`,
+      userId, bookId, now,
+    );
+  }
+
   private addToShelf(userId: string, bookId: string, now: number): void {
     this.db.run(
       `INSERT INTO user_books (user_id, book_id, added_at, hidden) VALUES (?, ?, ?, 0)
@@ -202,7 +342,7 @@ export class FileAcquisitions {
 
   private insertBook(
     bookId: string, parsed: ParsedSource, contentHash: string, size: number,
-    coverPath: string | undefined, entry: CatalogEntry, context: SourceContext, now: number,
+    coverPath: string | undefined, entry: CatalogEntry, pluginId: string, now: number,
   ): void {
     const m = parsed.metadata;
     const embedded = m.source === 'embedded';
@@ -217,7 +357,7 @@ export class FileAcquisitions {
       m.isbn, m.description || entry.description || '', m.series, m.seriesIndex,
       JSON.stringify(m.tags), m.pubdate || entry.publishedAt || '', coverPath ?? null, size,
       parsed.pageCount, JSON.stringify({ ...m.raw, kind: parsed.kind }),
-      embedded ? m.source : `provider:${context.instance.pluginId}`, now, now,
+      embedded ? m.source : `provider:${pluginId}`, now, now,
     );
   }
 }

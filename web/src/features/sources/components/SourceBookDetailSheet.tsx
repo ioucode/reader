@@ -2,6 +2,7 @@ import type { SourceEntry } from '../../../api/sources.ts';
 import { Sheet } from '../../../ui/sheet.tsx';
 import { Button } from '../../../ui/toolkit.tsx';
 import { FloatingNotice } from '../../../ui/floating-notice.tsx';
+import { SourceCover } from './SourceCover.tsx';
 
 /**
  * A source result's detail, shared by the source hub and a single source's catalog:
@@ -26,6 +27,7 @@ export function SourceBookDetailSheet({ detail, pending, error, acquiring, onAcq
       : <Button className="primary" disabled={acquiring} onClick={() => onAcquire(detail)}>加入书架</Button>}</>}>
     <FloatingNotice message={pending ? '正在读取书籍详情…' : ''} busy />
     <div className="book-detail">
+      <SourceCover url={detail.coverProxyUrl} title={detail.title} large />
       <p className="book-detail-author">{detail.authors?.join('、') || '作者未知'}</p>
       {error && <p className="notice error" role="alert">{error.message}</p>}
       <p className="book-detail-description">{detail.description || '暂无简介'}</p>

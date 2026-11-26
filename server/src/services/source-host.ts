@@ -8,8 +8,9 @@ import { AppError, badRequest, conflict, notFound } from '../lib/errors.ts';
 import { SourceRegistry } from '../sources/registry.ts';
 import { createLocalProvider } from '../sources/local.ts';
 import { createOpdsProvider } from '../sources/opds.ts';
-import type { SourceContext, SourceInstance, SourceProvider, SourceStorage, CredentialStore, SearchRequest } from '../sources/types.ts';
-import { FileAcquisitions } from '../sources/acquisitions.ts';
+import type { CatalogEntry, SourceContext, SourceInstance, SourceProvider, SourceStorage, CredentialStore, SearchRequest } from '../sources/types.ts';
+import { EXPORT_OPTION, FileAcquisitions } from '../sources/acquisitions.ts';
+import { SourceCovers } from './source-covers.ts';
 import { PluginManager } from '../sources/plugin-manager.ts';
 import { ChapterPublications } from '../publications/chapters.ts';
 import { ChapterUpdates } from './chapter-updates.ts';
@@ -26,6 +27,8 @@ export class SourceHost {
   private readonly access: SourceAccess;
   private readonly key: Buffer;
   private readonly acquisitions: FileAcquisitions;
+  /** Signs and serves source result covers (`coverProxyUrl`). */
+  readonly covers: SourceCovers;
   private activeCalls = 0;
   private readonly activeSources = new Map<string, number>();
 
@@ -33,6 +36,7 @@ export class SourceHost {
     this.access = new SourceAccess(db);
     this.key = createHash('sha256').update('reader/source-credentials/v1\0').update(config.jwtSecret).digest();
     this.acquisitions = new FileAcquisitions(db, config);
+    this.covers = new SourceCovers(config.jwtSecret);
     this.chapters = new ChapterPublications(db, {
       manifest: (userId, sourceId, ref, signal) => this.manifest(userId, sourceId, ref, signal),
       resource: (userId, sourceId, publicationRef, ref, signal) => this.call(userId, sourceId, (provider, ctx) => provider.readResource
@@ -213,7 +217,19 @@ export class SourceHost {
   async detail(userId: string, id: string, ref: string, signal?: AbortSignal) {
     return this.call(userId, id, (provider, ctx) => provider.detail(ctx, ref), signal);
   }
+  /** 「保存 EPUB」: put a finished export on the exporting user's shelf (see FileAcquisitions.importExported). */
+  /** Keyed by the resolved publicationRef (not the catalog entryRef alias), like the archive file name. */
+  async importEpubExport(userId: string, sourceId: string, publicationRef: string, bytes: Uint8Array, entry: CatalogEntry, contentDigest?: string): Promise<string> {
+    const row = this.instance(sourceId);
+    return this.acquisitions.importExported({ id: row.id, pluginId: row.plugin_id }, userId, publicationRef, bytes, entry, contentDigest);
+  }
+
+  previousEpubExport(userId: string, sourceId: string, publicationRef: string) {
+    return this.acquisitions.previousExport(sourceId, userId, publicationRef);
+  }
+
   async acquire(userId: string, id: string, entryRef: string, optionId?: string, signal?: AbortSignal) {
+    if (optionId?.startsWith(EXPORT_OPTION)) throw badRequest('invalid acquisition option', 'INVALID_ACQUISITION');
     return this.call(userId, id, async (provider, ctx) => {
       const acquisition = await provider.acquire(ctx, { entryRef, optionId });
       if (acquisition.kind === 'ready') {

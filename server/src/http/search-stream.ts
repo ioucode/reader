@@ -50,7 +50,7 @@ export function searchResponse(request: FastifyRequest, reply: FastifyReply, hos
         });
         const capped = refs.size >= limit;
         pages++; resultCount = refs.size; lastEventAt = Date.now();
-        const result = { ...page, items, ...(capped ? { nextCursor: undefined, limitReached: true } : {}) };
+        const result = { ...page, items: items.map(item => host.covers.entry(item, userId)), ...(capped ? { nextCursor: undefined, limitReached: true } : {}) };
         yield frame('results', result);
         // Stream ordinary provider pagination as well; the browser receives one
         // continuous result stream regardless of whether the provider is batched.

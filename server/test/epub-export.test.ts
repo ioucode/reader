@@ -1,11 +1,12 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import JSZip from 'jszip';
 import { AppError } from '../src/lib/errors.ts';
-import { EpubExportService, buildEpub, inside, paragraphs, privateAddress, safeName } from '../src/services/epub-export.ts';
+import { EpubExportService, buildEpub, coverFromEpub, inside, paragraphs, privateAddress, safeName } from '../src/services/epub-export.ts';
+import { createHash } from 'node:crypto';
 import type { SourceHost } from '../src/services/source-host.ts';
 
 describe('epub export helpers', () => {
@@ -33,8 +34,9 @@ describe('epub export helpers', () => {
   });
 
   test('privateAddress rejects internal ranges', () => {
-    for (const ip of ['10.0.0.1', '127.0.0.1', '172.16.3.4', '192.168.1.1', '169.254.1.1', '100.64.0.1', '::1', 'fd00::1', 'fe80::1', '::ffff:10.0.0.1', '::ffff:a00:1', '::ffff:7f00:1']) assert.equal(privateAddress(ip), true, ip);
-    for (const ip of ['1.1.1.1', '104.16.0.1', '2606:4700::1']) assert.equal(privateAddress(ip), false, ip);
+    for (const ip of ['10.0.0.1', '127.0.0.1', '172.16.3.4', '192.168.1.1', '169.254.1.1', '100.64.0.1', '::1', 'fd00::1', 'fe80::1', '::ffff:10.0.0.1', '::ffff:a00:1', '::ffff:7f00:1',
+      'fec0::1', '2001:db8::1', '2002:a00:1::1', '2001::1', '64:ff9b::a00:1', '100::1', '192.0.2.1', '203.0.113.9', '240.0.0.1', 'not-an-ip']) assert.equal(privateAddress(ip), true, ip);
+    for (const ip of ['1.1.1.1', '104.16.0.1', '2606:4700::1', '2400:cb00:2048:1::c629:d7a2']) assert.equal(privateAddress(ip), false, ip);
   });
 
   test('buildEpub writes a valid container with mimetype first and escaped text', async () => {
@@ -46,6 +48,12 @@ describe('epub export helpers', () => {
     const opf = await zip.file('OEBPS/content.opf')!.async('string');
     assert.match(opf, /<dc:title>书 &lt;&amp;&gt;<\/dc:title>/);
     const chapter = await zip.file('OEBPS/c00001.xhtml')!.async('string');
+    // A cover is manifest-only, so the spine (reading positions) is the same with or without one.
+    const spine = async (bytes: Uint8Array) => (await (await JSZip.loadAsync(bytes)).file('OEBPS/content.opf')!.async('string')).match(/<spine>.*<\/spine>/)![0];
+    const withCover = await buildEpub({ ref: '1', title: 't' }, [{ title: 'c', paragraphs: ['p'] }], { bytes: new Uint8Array([1]), mediaType: 'image/png' });
+    const without = await buildEpub({ ref: '1', title: 't' }, [{ title: 'c', paragraphs: ['p'] }]);
+    assert.equal(await spine(withCover), await spine(without));
+    assert.match(await (await JSZip.loadAsync(withCover)).file('OEBPS/content.opf')!.async('string'), /properties="cover-image"/);
     assert.match(chapter, /<p>a &lt; b<\/p><p>控制字符<\/p>/);
   });
 });
@@ -59,6 +67,8 @@ describe('EpubExportService', () => {
       { id: 'a', seq: 0, title: '一', kind: 'chapter', mediaType: 'text/plain', ref: 'r1' },
     ] }),
     resource: async (_u: string, _s: string, _p: string, ref: string) => ({ mediaType: 'text/plain; charset=utf-8', text: `正文 ${ref}` }),
+    importEpubExport: async () => 'book-1',
+    previousEpubExport: async () => undefined,
     ...overrides,
   }) as unknown as SourceHost;
   const until = async (fn: () => boolean) => { for (let i = 0; i < 300 && !fn(); i++) await new Promise((r) => setTimeout(r, 10)); };
@@ -82,6 +92,49 @@ describe('EpubExportService', () => {
       assert.match(await zip.file('OEBPS/c00001.xhtml')!.async('string'), /<h2>一<\/h2><p>正文 r1<\/p>/);
       assert.match(await zip.file('OEBPS/c00002.xhtml')!.async('string'), /正文 r2/);
       assert.throws(() => service.get('u2', job.id), /导出任务不存在/);
+      assert.equal(job.bookId, 'book-1');
+      assert.match(await zip.file('OEBPS/content.opf')!.async('string'), /<dc:identifier id="bookid">urn:reader:epub-export:[0-9a-f]{32}<\/dc:identifier>/);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test('imports the saved file for the exporting user; a failed shelf import keeps the archive', async () => {
+    const { root, dir, books } = await fixture();
+    try {
+      const calls: unknown[][] = [];
+      let fail = false;
+      const service = new EpubExportService(host({
+        importEpubExport: async (...args: unknown[]) => { calls.push(args); if (fail) throw new AppError(500, 'X', '书架写入失败'); return 'book-9'; },
+      }), dir, books);
+      const job = service.start('u1', 's1', 'e1');
+      await until(() => job.state !== 'running');
+      assert.equal(job.state, 'done', job.error);
+      assert.deepEqual(calls[0]!.slice(0, 3), ['u1', 's1', 'p1']); // keyed by publicationRef
+      assert.match(String(calls[0]![5]), /^[0-9a-f]{64}$/);
+      assert.deepEqual(Buffer.from(calls[0]![3] as Uint8Array), await readFile(join(dir, job.file!)));
+      assert.equal(job.bookId, 'book-9');
+
+      fail = true;
+      const again = service.start('u1', 's1', 'e1');
+      await until(() => again.state !== 'running');
+      assert.equal(again.state, 'done');
+      assert.equal(again.bookId, undefined);
+      assert.equal(again.shelfError, '书架写入失败');
+      assert.ok(again.file);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test('a failed cover fetch keeps the cover of the archive being replaced', async () => {
+    const { root, dir, books } = await fixture();
+    try {
+      const digest = createHash('sha256').update('s1\0p1').digest('hex').slice(0, 32);
+      await mkdir(join(dir, '某书源'), { recursive: true });
+      await writeFile(join(dir, '某书源', `测试书 [${digest}].epub`),
+        await buildEpub({ ref: 'e1', title: '测试书' }, [{ title: '一', paragraphs: ['旧'] }], { bytes: new Uint8Array([5, 6]), mediaType: 'image/png' }));
+      const service = new EpubExportService(host(), dir, books);
+      const job = service.start('u1', 's1', 'e1');
+      await until(() => job.state !== 'running');
+      assert.equal(job.state, 'done', job.error);
+      assert.deepEqual(await coverFromEpub(await readFile(join(dir, job.file!))), { bytes: new Uint8Array([5, 6]), mediaType: 'image/png' });
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
