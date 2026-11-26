@@ -2,7 +2,7 @@ import { extensionValues } from '../../sources/extensions.ts';
 import type { FastifyInstance } from 'fastify';
 import type { AppContext } from '../context.ts';
 import { authenticate, currentUser, requireAdmin } from '../auth.ts';
-import { badRequest } from '../../lib/errors.ts';
+import { badRequest, notFound } from '../../lib/errors.ts';
 import { SourceHost } from '../../services/source-host.ts';
 import { withSignal } from '../request-signal.ts';
 import { searchResponse } from '../search-stream.ts';
@@ -43,7 +43,7 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
   app.addHook('onReady', async () => { await host.plugins.loadInstalled(); host.updates.start(); host.plugins.startTasks(); });
   app.addHook('onClose', async () => { await host.updates.stop(); await host.plugins.close(); });
 
-  // 「保存 EPUB」: archive a chapter source entry as an EPUB outside the library, never onto a shelf.
+  // 「保存 EPUB」: archive a chapter source entry as an EPUB outside the library, then put a copy on the exporter's shelf.
   const exportsDir = exportDir(ctx.config);
   const exportsInsideLibrary = inside(ctx.config.booksDir, exportsDir); // 实际写入前还会按真实路径再查一次
   if (exportsInsideLibrary) app.log.warn({ exportsDir }, 'EPUB_EXPORT_DIR is inside BOOKS_DIR; EPUB export disabled');
@@ -52,6 +52,7 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
   const exportView = (job: EpubExportJob) => ({
     id: job.id, sourceId: job.sourceId, entryRef: job.entryRef, title: job.title, state: job.state,
     done: job.done, total: job.total, ...(job.file ? { file: job.file } : {}), ...(job.error ? { error: job.error } : {}),
+    ...(job.bookId ? { bookId: job.bookId } : {}), ...(job.shelfError ? { shelfError: job.shelfError } : {}),
   });
   app.post('/api/v1/sources/:id/epub-exports', { preHandler: auth }, async (request, reply) => {
     requireAdmin(request);
@@ -64,6 +65,16 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
   app.get('/api/v1/epub-exports/:jobId', { preHandler: auth }, async (request) => {
     requireAdmin(request);
     return { job: exportView(epubExports.get(currentUser(request).id, (request.params as { jobId: string }).jobId)) };
+  });
+
+  // Source result covers, fetched by the server; only links the server itself signed (SourceCovers).
+  app.get('/api/v1/source-covers', { preHandler: auth }, async (request, reply) => {
+    const q = request.query as { u?: unknown; s?: unknown };
+    const image = await withSignal(request, reply, (signal) => host.covers.load(q.u, q.s, signal));
+    if (!image) throw notFound('cover unavailable', 'COVER_UNAVAILABLE');
+    reply.header('cache-control', 'private, max-age=86400').header('x-content-type-options', 'nosniff')
+      .header('content-security-policy', "default-src 'none'; sandbox").type(image.mediaType);
+    return reply.send(Buffer.from(image.bytes));
   });
 
   app.get('/api/v1/subscriptions', { preHandler: auth }, async (request) => ({ subscriptions: host.updates.list(currentUser(request).id) }));
@@ -123,9 +134,9 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
   app.get('/api/v1/sources/:id/browse', { preHandler: auth }, async (request, reply) => {
     const user = currentUser(request); const { id } = request.params as { id: string };
     const q = request.query as { ref?: string; cursor?: string; limit?: string };
-    return withSignal(request, reply, (signal) => host.browse(user.id, id, {
+    return host.covers.page(await withSignal(request, reply, (signal) => host.browse(user.id, id, {
       ref: parameter(q.ref, 'ref'), cursor: parameter(q.cursor, 'cursor'), limit: pageLimit(q.limit),
-    }, signal));
+    }, signal)));
   });
   app.post('/api/v1/sources/:id/search', { preHandler: auth }, async (request, reply) => {
     const user = currentUser(request), { id } = request.params as { id: string };
@@ -149,7 +160,7 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
     const user = currentUser(request); const { id } = request.params as { id: string };
     const q = request.query as { ref?: string };
     const ref = parameter(q.ref, 'ref', true)!;
-    return withSignal(request, reply, (signal) => host.detail(user.id, id, ref, signal));
+    return host.covers.entry(await withSignal(request, reply, (signal) => host.detail(user.id, id, ref, signal)));
   });
   app.post('/api/v1/sources/:id/acquire', { preHandler: auth }, async (request, reply) => {
     const user = currentUser(request); const { id } = request.params as { id: string };

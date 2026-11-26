@@ -59,6 +59,7 @@ describe('EpubExportService', () => {
       { id: 'a', seq: 0, title: '一', kind: 'chapter', mediaType: 'text/plain', ref: 'r1' },
     ] }),
     resource: async (_u: string, _s: string, _p: string, ref: string) => ({ mediaType: 'text/plain; charset=utf-8', text: `正文 ${ref}` }),
+    importEpubExport: async () => 'book-1',
     ...overrides,
   }) as unknown as SourceHost;
   const until = async (fn: () => boolean) => { for (let i = 0; i < 300 && !fn(); i++) await new Promise((r) => setTimeout(r, 10)); };
@@ -82,6 +83,33 @@ describe('EpubExportService', () => {
       assert.match(await zip.file('OEBPS/c00001.xhtml')!.async('string'), /<h2>一<\/h2><p>正文 r1<\/p>/);
       assert.match(await zip.file('OEBPS/c00002.xhtml')!.async('string'), /正文 r2/);
       assert.throws(() => service.get('u2', job.id), /导出任务不存在/);
+      assert.equal(job.bookId, 'book-1');
+      assert.match(await zip.file('OEBPS/content.opf')!.async('string'), /<dc:identifier id="bookid">urn:reader:epub-export:[0-9a-f]{32}<\/dc:identifier>/);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test('imports the saved file for the exporting user; a failed shelf import keeps the archive', async () => {
+    const { root, dir, books } = await fixture();
+    try {
+      const calls: unknown[][] = [];
+      let fail = false;
+      const service = new EpubExportService(host({
+        importEpubExport: async (...args: unknown[]) => { calls.push(args); if (fail) throw new AppError(500, 'X', '书架写入失败'); return 'book-9'; },
+      }), dir, books);
+      const job = service.start('u1', 's1', 'e1');
+      await until(() => job.state !== 'running');
+      assert.equal(job.state, 'done', job.error);
+      assert.deepEqual(calls[0]!.slice(0, 3), ['u1', 's1', 'e1']);
+      assert.deepEqual(Buffer.from(calls[0]![3] as Uint8Array), await readFile(join(dir, job.file!)));
+      assert.equal(job.bookId, 'book-9');
+
+      fail = true;
+      const again = service.start('u1', 's1', 'e1');
+      await until(() => again.state !== 'running');
+      assert.equal(again.state, 'done');
+      assert.equal(again.bookId, undefined);
+      assert.equal(again.shelfError, '书架写入失败');
+      assert.ok(again.file);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

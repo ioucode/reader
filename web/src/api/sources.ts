@@ -10,6 +10,8 @@ export interface SourceInstance {
 }
 export interface SourceEntry {
   latestChapter?: string; sourceName?: string; coverUrl?: string;
+  /** Server-signed cover proxy path; load this (with auth), never coverUrl directly. */
+  coverProxyUrl?: string;
   ref: string; title: string; authors?: string[]; description?: string;
   options?: Array<{ id: string; label: string; available?: boolean }>;
 }
@@ -19,10 +21,11 @@ export interface SourcePage {
   errors?: Array<{ source: string; code: string; message: string }>;
   batch?: { completed: number; total: number };
 }
-/** 「保存 EPUB」后台任务:file 是相对 EPUB 存档目录的路径(<书源>/<书名>.epub)。 */
+/** 「保存 EPUB」后台任务:file 是相对 EPUB 存档目录的路径(<书源>/<书名>.epub);bookId 是放上书架的那本,shelfError 是存档成功但上书架失败的原因。 */
 export interface EpubExportJob {
   id: string; sourceId: string; entryRef: string; title: string;
   state: 'running' | 'done' | 'failed'; done: number; total: number; file?: string; error?: string;
+  bookId?: string; shelfError?: string;
 }
 export interface SourceAcquisition {
   kind: 'ready' | 'action-required'; publicationId?: string;

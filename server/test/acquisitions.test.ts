@@ -7,7 +7,8 @@ import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import JSZip from 'jszip';
 import { Db } from '../src/db/index.ts';
-import { FileAcquisitions } from '../src/sources/acquisitions.ts';
+import { EXPORT_OPTION, FileAcquisitions } from '../src/sources/acquisitions.ts';
+import { buildEpub } from '../src/services/epub-export.ts';
 import type { SourceContext, SourceInstance, SourceProvider } from '../src/sources/types.ts';
 
 function fixture(root: string): { db: Db; config: { dataDir: string }; context: SourceContext } {
@@ -218,6 +219,38 @@ describe('FileAcquisitions', () => {
       assert.equal(db.get('SELECT COUNT(*) AS n FROM acquired_files')?.n, 0);
       assert.equal((await readdir(join(root, 'acquired'))).length, 0);
       assert.equal((await readdir(join(root, 'covers'))).length, 0);
+    } finally {
+      db.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('importExported puts an exported EPUB on the shelf and a re-export replaces the earlier copy', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'reader-acquisition-'));
+    const { db, config } = fixture(root);
+    try {
+      const importer = new FileAcquisitions(db, config);
+      const entry = { ref: 'entry-1', title: '导出的书', authors: ['乙'] };
+      const first = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }], undefined, 'urn:reader:epub-export:abc');
+      const firstId = await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', first, entry);
+      const book = db.get<{ title: string; format: string }>('SELECT title, format FROM books WHERE id = ?', firstId);
+      assert.equal(book?.title, '导出的书');
+      assert.equal(book?.format, 'epub');
+      const file = db.get<{ rel_path: string }>('SELECT rel_path FROM acquired_files WHERE book_id = ?', firstId);
+      assert.deepEqual(await readFile(join(root, file!.rel_path)), Buffer.from(first));
+      assert.equal(db.get<{ hidden: number }>('SELECT hidden FROM user_books WHERE user_id = ? AND book_id = ?', 'u1', firstId)?.hidden, 0);
+      assert.equal(db.get<{ option_id: string }>('SELECT option_id FROM source_acquisitions WHERE book_id = ?', firstId)?.option_id, EXPORT_OPTION);
+
+      // Identical bytes: same book, still one shelf row.
+      assert.equal(await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', first, entry), firstId);
+
+      const second = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }, { title: '第2章', paragraphs: ['二'] }], undefined, 'urn:reader:epub-export:abc');
+      const secondId = await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', second, entry);
+      assert.notEqual(secondId, firstId);
+      const shelf = db.all<{ book_id: string; hidden: number }>('SELECT book_id, hidden FROM user_books WHERE user_id = ? ORDER BY hidden', 'u1')
+        .map(row => ({ book_id: row.book_id, hidden: row.hidden }));
+      assert.deepEqual(shelf, [{ book_id: secondId, hidden: 0 }, { book_id: firstId, hidden: 1 }]);
+      assert.deepEqual((await readdir(join(root, 'acquired'))).filter(name => name.endsWith('.part')), []);
     } finally {
       db.close();
       await rm(root, { recursive: true, force: true });
