@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { HttpTtsEngine } from '../src/render/tts-http.ts';
 
 /**
@@ -19,7 +19,7 @@ import { HttpTtsEngine } from '../src/render/tts-http.ts';
  * `play()` resolving is not the same as playback starting, and the engine must
  * not assume otherwise: the queue has to advance on `ended`.
  */
-class FakeAudio {
+class FakeAudio extends EventTarget {
   src = '';
   volume = 1;
   preload = '';
@@ -27,11 +27,7 @@ class FakeAudio {
   paused = true;
   playCalls = 0;
   pauseCalls = 0;
-  private handlers = new Map<string, () => void>();
 
-  addEventListener(type: string, handler: () => void): void {
-    this.handlers.set(type, handler);
-  }
 
   play(): Promise<void> {
     this.playCalls += 1;
@@ -55,7 +51,7 @@ class FakeAudio {
 
   /** Fires a registered event, as the media element would. */
   fire(type: string): void {
-    this.handlers.get(type)?.();
+    this.dispatchEvent(new Event(type));
   }
 }
 
@@ -76,8 +72,6 @@ function makeEngine(options: {
     createAudio: () => {
       const audio = new FakeAudio();
       audios.push(audio);
-      // The engine builds a *fresh* element per sentence, so the last one created
-      // is the one in flight; recording them lets a test fire its events.
       if (options.playFails) {
         audio.play = () => Promise.reject(new Error('blocked'));
       }
@@ -129,26 +123,27 @@ describe('HttpTtsEngine', () => {
 
     await engine.play(0);
     expect(audios).toHaveLength(1);
-    // Nothing has ended yet, so no second element may exist. A timer-driven queue
-    // is what this asserts against.
-    audios[0]!.fire('ended');
-    expect(audios).toHaveLength(2);
-    audios[1]!.fire('ended');
-    expect(audios).toHaveLength(3);
-    expect(audios[2]!.src).toContain(encodeURIComponent('三。'));
+    const audio = audios[0]!;
+    expect(audio.playCalls).toBe(1);
+    audio.fire('ended');
+    expect(audio.src).toContain(encodeURIComponent('二。'));
+    audio.fire('ended');
+    expect(audio.src).toContain(encodeURIComponent('三。'));
+    expect(audio.playCalls).toBe(3);
+    expect(audios).toHaveLength(1);
   });
 
-  it('does not advance when a stale element reports it finished', async () => {
-    const { engine, audios } = makeEngine({ chunks: [['一。', '二。', '三。']] });
+  it('resumes the same clip after a pause', async () => {
+    const { engine, audios } = makeEngine({ chunks: [['一。', '二。']] });
     await engine.play(0);
-
-    // The reader pressed "next", which starts a new generation. The old element's
-    // `ended` arriving afterwards must be ignored, or the queue would skip a
-    // sentence every time the button is used.
-    engine.next();
-    expect(audios).toHaveLength(2);
-    audios[0]!.fire('ended');
-    expect(audios).toHaveLength(2);
+    const audio = audios[0]!;
+    const source = audio.src;
+    engine.pause();
+    expect(audio.paused).toBe(true);
+    engine.resume();
+    expect(audio.paused).toBe(false);
+    expect(audio.src).toBe(source);
+    expect(engine.snapshot.index).toBe(0);
   });
 
   it('stops speaking when the reader stops, and releases the element', async () => {
@@ -199,8 +194,8 @@ describe('HttpTtsEngine', () => {
     // handshake the system engine uses, and the place a chapter transition happens.
     await Promise.resolve();
     await Promise.resolve();
-    expect(audios).toHaveLength(2);
-    expect(audios[1]!.src).toContain(encodeURIComponent('二。'));
+    expect(audios).toHaveLength(1);
+    expect(audios[0]!.src).toContain(encodeURIComponent('二。'));
   });
 
   it('will not build a URL without a server, and says so rather than failing silently', async () => {
@@ -227,5 +222,95 @@ describe('HttpTtsEngine', () => {
     expect(capabilities?.http).toBe(true);
     expect(capabilities?.voices).toHaveLength(1);
     fetchSpy.mockRestore();
+  });
+});
+
+
+describe('HTTP audio prefetch', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function mockPrefetch() {
+    let respond!: (response: Response) => void;
+    const fetchAudio = vi.fn((_url: string, _init: RequestInit) => new Promise<Response>((resolve) => { respond = resolve; }));
+    const createObjectURL = vi.fn(() => 'blob:test-clip');
+    const revokeObjectURL = vi.fn();
+    const MockURL = class extends URL {
+      static override createObjectURL = createObjectURL;
+      static override revokeObjectURL = revokeObjectURL;
+    };
+    vi.stubGlobal('fetch', fetchAudio);
+    vi.stubGlobal('URL', MockURL);
+    const resolveAudio = () => respond(new Response('audio', { headers: { 'content-type': 'audio/mpeg' } }));
+    return { fetchAudio, respond: (response: Response) => respond(response), resolveAudio, revokeObjectURL };
+  }
+
+  it('requests only the next clip, reuses its in-flight download and releases its URL', async () => {
+    const { fetchAudio, resolveAudio, revokeObjectURL } = mockPrefetch();
+    const { engine, audios } = makeEngine({ chunks: [['一。', '二。', '三。']], token: 'reader-token' });
+    await engine.play(0);
+    const audio = audios[0]!;
+    expect(fetchAudio).not.toHaveBeenCalled();
+
+    audio.fire('playing');
+    expect(fetchAudio).toHaveBeenCalledExactlyOnceWith(
+      'http://nas.local:8080/api/v1/tts?text=' + encodeURIComponent('二。'),
+      expect.objectContaining({ headers: { accept: 'audio/*', authorization: 'Bearer reader-token' } }),
+    );
+    audio.fire('ended');
+    expect(audio.playCalls).toBe(1);
+    expect(fetchAudio).toHaveBeenCalledTimes(1);
+
+    resolveAudio();
+    await vi.waitFor(() => expect(audio.src).toBe('blob:test-clip'));
+    expect(audio.playCalls).toBe(2);
+    expect(audios).toHaveLength(1);
+
+    audio.fire('playing');
+    expect(fetchAudio).toHaveBeenCalledTimes(2);
+    engine.stop();
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:test-clip');
+    expect(engine.active).toBe(false);
+  });
+
+  it('retries with the regular playback URL if prefetch fails', async () => {
+    const { respond } = mockPrefetch();
+    const { engine, audios, errors } = makeEngine({ chunks: [['一。', '二。']] });
+    await engine.play(0);
+    const audio = audios[0]!;
+    audio.fire('playing');
+    respond(new Response(null, { status: 503 }));
+    audio.fire('ended');
+
+    await vi.waitFor(() => expect(audio.src).toContain(encodeURIComponent('二。')));
+    expect(errors).toEqual([]);
+    expect(audio.playCalls).toBe(2);
+    engine.stop();
+  });
+
+  it.each(['jump', 'stop', 'voice'] as const)('discards stale prefetch on %s', async (action) => {
+    const { fetchAudio, resolveAudio } = mockPrefetch();
+    const { engine, audios } = makeEngine({ chunks: [['一。', '二。', '三。']] });
+    engine.setVoice('old');
+    await engine.play(0);
+    const audio = audios[0]!;
+    audio.fire('playing');
+    const [, request] = fetchAudio.mock.calls[0]!;
+    resolveAudio();
+
+    if (action === 'jump') engine.jump(2);
+    if (action === 'stop') engine.stop();
+    if (action === 'voice') engine.setVoice('new');
+    expect(request.signal?.aborted).toBe(true);
+    await Promise.resolve();
+
+    if (action === 'voice') {
+      expect(fetchAudio.mock.calls[1]![0]).toContain('voice=new');
+      expect(audio.src).toContain('voice=old');
+    } else if (action === 'jump') {
+      expect(audio.src).toContain(encodeURIComponent('三。'));
+    } else {
+      expect(audio.src).toBe('');
+    }
+    engine.stop();
   });
 });

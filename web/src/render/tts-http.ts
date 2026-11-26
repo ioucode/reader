@@ -18,12 +18,10 @@
  *
  * Three reasons, and the first is the one that decides it:
  *
- *  1. **The access token rides in the query string on nothing else.** An
- *     `<audio src>` is a browser-managed request: it cannot carry an
- *     `Authorization` header, and it will not accept a `fetch` + Blob URL without
- *     losing the buffering that makes playback start before the sentence has
- *     finished downloading. That is exactly why the server accepts a query token
- *     on this one route (see `server/src/http/auth.ts`), and only on `GET`.
+ *  1. **Immediate playback uses a media URL.** An `<audio src>` cannot carry
+ *     an authorization header, so the first clip uses the route's query token.
+ *     While that clip plays, a separate authenticated fetch downloads the next
+ *     one as a Blob. The same element plays both kinds of source.
  *  2. **The platform's own decode path.** Media decoding happens off the main
  *     thread and out of the JS heap; a 60-minute novel is a lot of audio, and
  *     Web Audio would keep it all in the renderer process.
@@ -75,6 +73,12 @@ export interface HttpTtsOptions {
  */
 const REQUEST_TIMEOUT_MS = 20_000;
 
+interface PrefetchedClip {
+  index: number;
+  controller: AbortController;
+  result: Promise<Blob | null>;
+}
+
 /** Longest single utterance this engine will ask for. Mirrors the server's cap. */
 export const HTTP_TTS_MAX_LENGTH = 800;
 
@@ -90,11 +94,16 @@ export const HTTP_TTS_MAX_LENGTH = 800;
 export class HttpTtsEngine {
   private readonly options: HttpTtsOptions;
   private audio: HTMLAudioElement | null = null;
+  private clip: AbortController | null = null;
+  private objectUrl: string | null = null;
+  private hasStarted = false;
+  private prefetch: PrefetchedClip | null = null;
   private state: TtsState = 'idle';
   private error = '';
   private queue: string[] = [];
   private cursor = -1;
   private rate = 1;
+  private volume = 1;
   private voiceId = '';
   /** Generation counter: bumped on stop, so a late response is ignored. */
   private generation = 0;
@@ -144,7 +153,7 @@ export class HttpTtsEngine {
       // Synthesised audio has no pitch control that does not go through
       // `playbackRate`, and a shimmed pitch is worse than no pitch control.
       pitch: 1,
-      volume: this.audio?.volume ?? 1,
+      volume: this.volume,
       voiceId: this.voiceId,
       voices: [],
       error: this.error,
@@ -177,15 +186,17 @@ export class HttpTtsEngine {
       this.resume();
       return;
     }
+    const generation = ++this.generation;
+    this.cancelPrefetch();
+    this.releaseClip();
     const loaded = await this.loadQueue(from);
+    if (generation !== this.generation) return;
     if (!loaded || loaded.chunks.length === 0) {
       this.state = 'idle';
       this.error = '这一章没有可朗读的文字';
       this.emit();
       return;
     }
-    this.stopAudio();
-    this.generation += 1;
     this.queue = loaded.chunks.map((chunk) => chunk.text);
     this.cursor = clamp(loaded.startIndex, 0, this.queue.length - 1) - 1;
     this.error = '';
@@ -196,6 +207,7 @@ export class HttpTtsEngine {
   pause(): void {
     if (this.state !== 'playing') return;
     this.state = 'paused';
+    this.clearTimeout();
     this.audio?.pause();
     this.emit();
   }
@@ -203,17 +215,16 @@ export class HttpTtsEngine {
   resume(): void {
     if (this.state !== 'paused') return;
     this.state = 'playing';
-    // The sentence is replayed from the start rather than resumed mid-word. This
-    // is the honest behaviour for a remote engine: the audio element was
-    // released when paused (see `pause`), so there is no position to resume to,
-    // and a reader who paused does not mind hearing the sentence's first word
-    // again — but does mind hearing the previous one.
-    this.speakNext();
+    this.emit();
+    if (!this.clip) return;
+    if (this.audio?.ended) this.speakNext();
+    else this.playClip();
   }
 
   stop(): void {
     this.generation += 1;
-    this.stopAudio();
+    this.cancelPrefetch();
+    this.releaseClip();
     this.queue = [];
     this.cursor = -1;
     this.state = 'idle';
@@ -225,7 +236,6 @@ export class HttpTtsEngine {
   jump(index: number): void {
     if (this.queue.length === 0) return;
     this.generation += 1;
-    this.stopAudio();
     this.cursor = clamp(index, 0, this.queue.length - 1) - 1;
     this.state = 'playing';
     this.speakNext();
@@ -256,93 +266,157 @@ export class HttpTtsEngine {
   }
 
   setVolume(volume: number): void {
-    const value = clamp(volume, 0, 1);
-    if (this.audio) this.audio.volume = value;
+    this.volume = clamp(volume, 0, 1);
+    if (this.audio) this.audio.volume = this.volume;
     this.emit();
   }
 
   setVoice(voiceId: string): void {
+    if (this.voiceId === voiceId) return;
     this.voiceId = voiceId;
+    const wasWaitingForClip = this.prefetch?.index === this.cursor;
+    this.cancelPrefetch();
+    if (wasWaitingForClip) this.loadClip();
+    if (this.state === 'playing' && this.hasStarted) this.prefetchNext();
     this.emit();
   }
 
   dispose(): void {
     this.generation += 1;
-    this.stopAudio();
+    this.cancelPrefetch();
+    this.releaseClip();
+    this.audio = null;
     this.queue = [];
+    this.state = 'idle';
     this.listeners.clear();
   }
 
   // ---- internals ----
 
-  /**
-   * Fetches and plays the sentence after the cursor, or finishes.
-   *
-   * All terminal paths funnel here — the `ended` event, the timeout, the
-   * queue-exhausted branch — for the same reason the system engine does: two of
-   * them advancing the cursor at once is the bug that makes a reader repeat a
-   * sentence forever.
-   */
   private speakNext(): void {
     if (this.state !== 'playing') return;
+    this.releaseClip();
     const nextIndex = this.cursor + 1;
-    const text = this.queue[nextIndex];
-    if (text === undefined) {
+    if (this.prefetch?.index !== nextIndex) this.cancelPrefetch();
+    if (this.queue[nextIndex] === undefined) {
       void this.finish();
       return;
     }
-    this.cursor = nextIndex;
-    this.emit();
 
+    this.cursor = nextIndex;
     const generation = this.generation;
-    const url = this.buildUrl('/api/v1/tts', {
-      text,
-      ...(this.voiceId ? { voice: this.voiceId } : {}),
-      // No `speed` here: the rate is applied once, by `playbackRate` below (and
-      // live by `setRate`). Asking the server for a sped-up clip as well played
-      // it at rate × rate — 1.5× came out at 2.25×.
-    });
-    if (!url) {
+    this.emit();
+    if (generation !== this.generation || this.clip) return;
+
+    if (this.prefetch) {
+      void this.playPrefetched(this.prefetch, generation);
+    } else {
+      this.loadClip();
+    }
+  }
+
+  private async playPrefetched(prefetch: PrefetchedClip, generation: number): Promise<void> {
+    const blob = await prefetch.result;
+    if (this.prefetch !== prefetch || this.generation !== generation) return;
+    this.prefetch = null;
+    this.loadClip(blob);
+  }
+
+  private loadClip(blob: Blob | null = null): void {
+    const source = blob ? URL.createObjectURL(blob) : this.sentenceUrl(this.cursor, true);
+    if (!source) {
       this.fail('HTTP 朗读未配置');
       return;
     }
+    if (blob) this.objectUrl = source;
 
-    const audio = this.createAudio();
+    const audio = this.audio ??= this.createAudio();
+    const clip = this.clip = new AbortController();
+    const signal = clip.signal;
+    audio.addEventListener('ended', () => this.speakNext(), { once: true, signal });
+    audio.addEventListener('error', () => this.fail('朗读音频加载失败'), { once: true, signal });
+    audio.addEventListener('playing', () => {
+      this.clearTimeout();
+      this.hasStarted = true;
+      if (this.state === 'playing') this.prefetchNext();
+    }, { signal });
+    audio.addEventListener('waiting', () => {
+      if (this.state === 'playing') this.watchForPlayback(clip);
+    }, { signal });
+
     audio.preload = 'auto';
-    audio.volume = clamp(1, 0, 1);
-    this.audio = audio;
-
-    const advance = (): void => {
-      if (generation !== this.generation) return;
-      this.clearTimeout();
-      this.speakNext();
-    };
-    audio.addEventListener('ended', advance, { once: true });
-    audio.addEventListener('error', () => {
-      if (generation !== this.generation) return;
-      this.clearTimeout();
-      this.fail('朗读音频加载失败');
-    }, { once: true });
-
-    audio.src = url;
+    audio.src = source;
     audio.playbackRate = this.rate;
-    void audio.play().catch(() => {
-      // Autoplay policies reject play() when it is not the direct result of a
-      // gesture. The reader did press play, so this is almost always a
-      // transient decode/permission failure rather than a policy one; reporting
-      // it is better than a bar that says "playing" while nothing is heard.
-      if (generation !== this.generation) return;
+    audio.volume = this.volume;
+    if (this.state === 'playing') this.playClip();
+  }
+
+  private playClip(): void {
+    const { audio, clip } = this;
+    if (!audio || !clip) return;
+    this.watchForPlayback(clip);
+    void audio.play().catch((error: unknown) => {
+      if (clip.signal.aborted || this.state !== 'playing') return;
+      if (error instanceof DOMException && error.name === 'AbortError') return;
       this.fail('浏览器阻止了朗读播放，请再按一次播放');
     });
+  }
 
-    // The watchdog is what makes a stalled request visible instead of silence.
-    this.clearTimeout();
+  private watchForPlayback(clip: AbortController): void {
+    if (this.timeout !== null) return;
     const schedule = this.options.setTimeout ?? setTimeout;
     this.timeout = schedule(() => {
       this.timeout = null;
-      if (generation !== this.generation) return;
-      if (this.state === 'playing') this.speakNext();
-    }, Math.max(1000,Math.min(125000,this.options.requestTimeoutMs?.()??REQUEST_TIMEOUT_MS)));
+      if (!clip.signal.aborted) this.speakNext();
+    }, this.requestTimeout());
+  }
+
+  private prefetchNext(): void {
+    if (this.prefetch) return;
+    const index = this.cursor + 1;
+    const url = this.sentenceUrl(index, false);
+    if (!url) return;
+    const controller = new AbortController();
+    this.prefetch = { index, controller, result: this.fetchClip(url, controller) };
+  }
+
+  private async fetchClip(url: string, controller: AbortController): Promise<Blob | null> {
+    const schedule = this.options.setTimeout ?? setTimeout;
+    const timer = schedule(() => controller.abort(), this.requestTimeout());
+    try {
+      const response = await fetch(url, {
+        headers: { ...this.headers(), accept: 'audio/*' },
+        mode: 'cors',
+        credentials: 'omit',
+        signal: controller.signal,
+      });
+      if (!response.ok) return null;
+      const blob = await response.blob();
+      return blob.size && blob.type.startsWith('audio/') ? blob : null;
+    } catch {
+      return null;
+    } finally {
+      (this.options.clearTimeout ?? clearTimeout)(timer);
+    }
+  }
+
+  private cancelPrefetch(): void {
+    this.prefetch?.controller.abort();
+    this.prefetch = null;
+  }
+
+  private requestTimeout(): number {
+    return clamp(this.options.requestTimeoutMs?.() ?? REQUEST_TIMEOUT_MS, 1_000, 125_000);
+  }
+
+  private sentenceUrl(index: number, queryToken: boolean): string | null {
+    const text = this.queue[index];
+    if (text === undefined) return null;
+    // The media element applies the playback rate to both kinds of source.
+    return this.buildUrl('/api/v1/tts', {
+      text,
+      ...(this.voiceId ? { voice: this.voiceId } : {}),
+    }, queryToken);
   }
 
   /**
@@ -370,7 +444,8 @@ export class HttpTtsEngine {
   private fail(message: string): void {
     this.error = message;
     this.state = 'idle';
-    this.stopAudio();
+    this.cancelPrefetch();
+    this.releaseClip();
     this.emit();
     this.options.onError?.(message);
   }
@@ -407,20 +482,19 @@ export class HttpTtsEngine {
     return audio;
   }
 
-  private stopAudio(): void {
+  private releaseClip(): void {
     this.clearTimeout();
-    const audio = this.audio;
-    this.audio = null;
-    if (!audio) return;
-    // Releasing the element matters more than stopping it: an `<audio>` left with
-    // a `src` keeps a network buffer alive, and a chapter of sentences would leak
-    // one per sentence.
-    try {
-      audio.pause();
-      audio.removeAttribute('src');
-      audio.load();
-    } catch {
-      // A detached element in a test double; nothing to release.
+    this.hasStarted = false;
+    if (!this.clip) return;
+
+    this.clip.abort();
+    this.clip = null;
+    this.audio?.pause();
+    this.audio?.removeAttribute('src');
+    this.audio?.load();
+    if (this.objectUrl) {
+      URL.revokeObjectURL(this.objectUrl);
+      this.objectUrl = null;
     }
   }
 
@@ -438,11 +512,11 @@ export class HttpTtsEngine {
    * URL with a bearer token in it must not go to a third party, in logs or in a
    * `Referer` header.
    */
-  private buildUrl(path: string, params: Record<string, string>): string | null {
+  private buildUrl(path: string, params: Record<string, string>, queryToken = true): string | null {
     const base = this.options.baseUrl.replace(/\/+$/, '');
     if (!base) return null;
     const query = new URLSearchParams(params);
-    const token = this.options.accessToken();
+    const token = queryToken ? this.options.accessToken() : null;
     if (token) query.set('access_token', token);
     const suffix = query.size > 0 ? `?${query.toString()}` : '';
     return `${base}${path}${suffix}`;
