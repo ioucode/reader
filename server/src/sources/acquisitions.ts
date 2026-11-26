@@ -264,15 +264,24 @@ export class FileAcquisitions {
         // chapter layout, which a changed source can shift. They stay with the old version,
         // which remains restorable. A manual reading status (想读/在读/已读) is about the book,
         // so it follows the replacement.
-        const status = previous && previous !== bookId
-          ? this.db.get<{ reading_status: string | null }>('SELECT reading_status FROM user_books WHERE user_id = ? AND book_id = ?', userId, previous)?.reading_status ?? null
-          : null;
-        this.db.run(
-          `INSERT INTO user_books (user_id, book_id, added_at, hidden, reading_status) VALUES (?, ?, ?, 0, ?)
-           ON CONFLICT(user_id, book_id) DO UPDATE SET hidden = 0, added_at = excluded.added_at,
-           reading_status = COALESCE(user_books.reading_status, excluded.reading_status)`,
-          userId, bookId, now, status,
-        );
+        // (Copied verbatim, NULL included, from the outgoing version — it is the current one.)
+        if (previous && previous !== bookId) {
+          const status = this.db.get<{ reading_status: string | null }>(
+            'SELECT reading_status FROM user_books WHERE user_id = ? AND book_id = ?', userId, previous)?.reading_status ?? null;
+          this.db.run(
+            `INSERT INTO user_books (user_id, book_id, added_at, hidden, reading_status) VALUES (?, ?, ?, 0, ?)
+             ON CONFLICT(user_id, book_id) DO UPDATE SET hidden = 0, added_at = excluded.added_at, reading_status = excluded.reading_status`,
+            userId, bookId, now, status,
+          );
+        } else {
+          // Same version again: only (re)show it; 最近入库 order moves only when it was not visible.
+          this.db.run(
+            `INSERT INTO user_books (user_id, book_id, added_at, hidden) VALUES (?, ?, ?, 0)
+             ON CONFLICT(user_id, book_id) DO UPDATE SET hidden = 0,
+             added_at = CASE WHEN user_books.hidden = 1 THEN excluded.added_at ELSE user_books.added_at END`,
+            userId, bookId, now,
+          );
+        }
       });
       keepFile = this.db.get<{ rel_path: string }>('SELECT rel_path FROM acquired_files WHERE book_id = ?', bookId)?.rel_path === relPath;
       keepCover = coverPath !== undefined && this.db.get<{ cover_path: string | null }>('SELECT cover_path FROM books WHERE id = ?', bookId)?.cover_path === coverPath;

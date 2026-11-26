@@ -14,8 +14,8 @@ const PROXY_PREFIX = '/api/v1/source-covers?';
  * - Loading starts only when the row comes near the viewport (a search can return
  *   thousands of results) and is cancelled if the row scrolls away or unmounts first;
  *   a busy proxy (503) is retried a few times with backoff while the row is visible.
- * - The image is held as an object URL owned by this component and revoked on
- *   unmount, so repeated searches do not pile up blobs.
+ * - The image is held as an object URL owned by this component and revoked once the
+ *   row is far off-screen or unmounted (the server keeps a cache, so coming back is cheap).
  */
 export function SourceCover({ url, title, large = false }: { url: string | undefined; title: string; large?: boolean }) {
   const { api } = useRuntime();
@@ -25,15 +25,18 @@ export function SourceCover({ url, title, large = false }: { url: string | undef
   const [src, setSrc] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
 
-  // Track (not just latch) visibility: a row scrolled away cancels its pending request.
+  // Track (not just latch) visibility: a row scrolled away cancels its pending request
+  // and releases its image, so scrolling a long result list does not keep every blob alive.
   useEffect(() => {
-    if (!link || src) return;
+    if (!link) return;
     const node = box.current;
     if (!node || typeof IntersectionObserver === 'undefined') { setNear(true); return; }
     const observer = new IntersectionObserver(entries => setNear(entries.some(entry => entry.isIntersecting)), { rootMargin: '300px' });
     observer.observe(node);
     return () => observer.disconnect();
-  }, [link, src]);
+  }, [link]);
+
+  useEffect(() => { if (!near && src) setSrc(null); }, [near, src]);
 
   useEffect(() => { setSrc(null); setAttempt(0); }, [link]);
 

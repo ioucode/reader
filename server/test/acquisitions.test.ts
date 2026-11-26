@@ -242,11 +242,13 @@ describe('FileAcquisitions', () => {
       assert.equal(db.get<{ hidden: number }>('SELECT hidden FROM user_books WHERE user_id = ? AND book_id = ?', 'u1', firstId)?.hidden, 0);
       assert.equal(db.get<{ option_id: string }>('SELECT option_id FROM source_acquisitions WHERE book_id = ?', firstId)?.option_id, EXPORT_OPTION);
 
+      const addedAt = db.get<{ added_at: number }>('SELECT added_at FROM user_books WHERE book_id = ?', firstId)!.added_at;
       // Same content built again later: identical bytes, same book, still one shelf row.
       await new Promise(resolve => setTimeout(resolve, 1100));
       const rebuilt = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }], undefined, options);
       assert.deepEqual(Buffer.from(rebuilt), Buffer.from(first));
       assert.equal(await importer.importExported({ id: 's1', pluginId: 'demo' }, 'u1', 'entry-1', rebuilt, entry), firstId);
+      assert.equal(db.get<{ added_at: number }>('SELECT added_at FROM user_books WHERE book_id = ?', firstId)!.added_at, addedAt);
 
       db.run(`UPDATE user_books SET reading_status = 'want' WHERE user_id = 'u1' AND book_id = ?`, firstId);
       const second = await buildEpub(entry, [{ title: '第1章', paragraphs: ['一'] }, { title: '第2章', paragraphs: ['二'] }], undefined, options);
