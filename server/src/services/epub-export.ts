@@ -145,8 +145,10 @@ export class EpubExportService {
       chapters.push({ title: item.title, paragraphs: body });
       job.done++;
     }
-    // Identifies the text alone; a re-export with the same text keeps the shelf copy (see importExported).
-    const contentDigest = createHash('sha256').update(JSON.stringify(chapters)).digest('hex');
+    // Identifies the readable content (introduction + chapters) but not the cover; a re-export with
+    // the same content keeps the shelf copy (see importExported).
+    const contentDigest = createHash('sha256')
+      .update(JSON.stringify([entry.title, entry.authors ?? [], entry.description ?? '', entry.language ?? '', chapters])).digest('hex');
     // A failed cover fetch reuses the previous export's cover.
     const previous = await Promise.resolve().then(() => this.host.previousEpubExport(job.userId, job.sourceId, publicationRef)).catch(() => undefined);
     const cover = await fetchRemoteImage(entry.coverUrl, signal).catch(() => undefined) ?? previous?.cover;

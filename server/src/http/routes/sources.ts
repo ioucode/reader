@@ -70,7 +70,7 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
   // Source result covers, fetched by the server; only links the server itself signed (SourceCovers).
   app.get('/api/v1/source-covers', { preHandler: auth }, async (request, reply) => {
     const q = request.query as { t?: unknown };
-    const image = await withSignal(request, reply, (signal) => host.covers.load(q.t, signal));
+    const image = await withSignal(request, reply, (signal) => host.covers.load(q.t, currentUser(request).id, signal));
     if (!image) throw notFound('cover unavailable', 'COVER_UNAVAILABLE');
     reply.header('cache-control', 'private, max-age=86400').header('x-content-type-options', 'nosniff')
       .header('content-security-policy', "default-src 'none'; sandbox").type(image.mediaType);
@@ -136,7 +136,7 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
     const q = request.query as { ref?: string; cursor?: string; limit?: string };
     return host.covers.page(await withSignal(request, reply, (signal) => host.browse(user.id, id, {
       ref: parameter(q.ref, 'ref'), cursor: parameter(q.cursor, 'cursor'), limit: pageLimit(q.limit),
-    }, signal)));
+    }, signal)), user.id);
   });
   app.post('/api/v1/sources/:id/search', { preHandler: auth }, async (request, reply) => {
     const user = currentUser(request), { id } = request.params as { id: string };
@@ -160,7 +160,7 @@ export function registerSourceRoutes(app: FastifyInstance, ctx: AppContext): voi
     const user = currentUser(request); const { id } = request.params as { id: string };
     const q = request.query as { ref?: string };
     const ref = parameter(q.ref, 'ref', true)!;
-    return host.covers.entry(await withSignal(request, reply, (signal) => host.detail(user.id, id, ref, signal)));
+    return host.covers.entry(await withSignal(request, reply, (signal) => host.detail(user.id, id, ref, signal)), user.id);
   });
   app.post('/api/v1/sources/:id/acquire', { preHandler: auth }, async (request, reply) => {
     const user = currentUser(request); const { id } = request.params as { id: string };

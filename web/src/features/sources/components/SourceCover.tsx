@@ -24,6 +24,8 @@ export function SourceCover({ url, title, large = false }: { url: string | undef
   const [near, setNear] = useState(false);
   const [src, setSrc] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
+  // Bytes that arrived but do not decode: keep the placeholder and do not refetch them.
+  const [broken, setBroken] = useState(false);
 
   // Track (not just latch) visibility: a row scrolled away cancels its pending request
   // and releases its image, so scrolling a long result list does not keep every blob alive.
@@ -38,10 +40,10 @@ export function SourceCover({ url, title, large = false }: { url: string | undef
 
   useEffect(() => { if (!near && src) setSrc(null); }, [near, src]);
 
-  useEffect(() => { setSrc(null); setAttempt(0); }, [link]);
+  useEffect(() => { setSrc(null); setAttempt(0); setBroken(false); }, [link]);
 
   useEffect(() => {
-    if (!link || !near || src) return;
+    if (!link || !near || src || broken) return;
     const controller = new AbortController();
     let retry: ReturnType<typeof setTimeout> | undefined;
     void api.coverBytes(link, { signal: controller.signal }).then(bytes => {
@@ -54,13 +56,13 @@ export function SourceCover({ url, title, large = false }: { url: string | undef
       }
     });
     return () => { controller.abort(); if (retry) clearTimeout(retry); };
-  }, [api, link, near, attempt, src]);
+  }, [api, link, near, attempt, src, broken]);
 
   // The object URL belongs to this component: released when replaced or unmounted.
   useEffect(() => () => { if (src) URL.revokeObjectURL(src); }, [src]);
 
   if (!link) return null;
   return <div ref={box} className={'source-cover' + (large ? ' is-large' : '')} aria-hidden="true">
-    {src ? <img src={src} alt="" /> : <div className="placeholder" style={coverTint(title)} />}
+    {src && !broken ? <img src={src} alt="" onError={() => setBroken(true)} /> : <div className="placeholder" style={coverTint(title)} />}
   </div>;
 }

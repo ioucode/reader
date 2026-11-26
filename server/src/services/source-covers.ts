@@ -48,13 +48,14 @@ export class SourceCovers {
   }
 
   /** The browser-facing path for a cover, or undefined when the URL is not something the proxy would fetch. */
-  proxyPath(url: string | undefined): string | undefined {
+  proxyPath(url: string | undefined, userId: string): string | undefined {
     if (!fetchableImageUrl(url)) return undefined;
     try {
       // Sign the normalized form: it is what gets encoded, sent back and fetched.
       const href = new URL(url).href;
       if (!fetchableImageUrl(href)) return undefined;
-      return `${PROXY_PATH}?t=${this.seal(href)}`;
+      // Bound to the account it was issued to: a token copied elsewhere (e.g. from a log) is useless.
+      return `${PROXY_PATH}?t=${this.seal(`${userId}\n${href}`)}`;
     } catch { return undefined; }
   }
 
@@ -63,20 +64,22 @@ export class SourceCovers {
    * value: a plugin-supplied one is dropped, since the client fetches it with the
    * user's credentials.
    */
-  entry<T extends CatalogEntry>(entry: T): T & { coverProxyUrl?: string } {
+  entry<T extends CatalogEntry>(entry: T, userId: string): T & { coverProxyUrl?: string } {
     const { coverProxyUrl: _plugin, ...rest } = entry as T & { coverProxyUrl?: unknown };
-    const path = this.proxyPath(entry.coverUrl);
+    const path = this.proxyPath(entry.coverUrl, userId);
     return (path ? { ...rest, coverProxyUrl: path } : rest) as T & { coverProxyUrl?: string };
   }
 
-  page<T extends CatalogPage>(page: T): T {
-    return { ...page, items: page.items.map((item) => this.entry(item)) } as T;
+  page<T extends CatalogPage>(page: T, userId: string): T {
+    return { ...page, items: page.items.map((item) => this.entry(item, userId)) } as T;
   }
 
   /** Verified fetch; undefined means "no image" (the route answers 404). */
-  async load(token: unknown, signal: AbortSignal): Promise<RemoteImage | undefined> {
-    const url = typeof token === 'string' ? this.open(token) : undefined;
-    if (!url) throw new AppError(403, 'COVER_SIGNATURE', 'invalid cover link');
+  async load(token: unknown, userId: string, signal: AbortSignal): Promise<RemoteImage | undefined> {
+    const opened = typeof token === 'string' ? this.open(token) : undefined;
+    const split = opened?.indexOf('\n') ?? -1;
+    if (!opened || split < 0 || opened.slice(0, split) !== userId) throw new AppError(403, 'COVER_SIGNATURE', 'invalid cover link');
+    const url = opened.slice(split + 1);
     if (!fetchableImageUrl(url)) throw badRequest('invalid cover link', 'COVER_URL');
     const cached = this.cache.get(url);
     if (cached && Date.now() - cached.at < (cached.image ? CACHE_SUCCESS_MS : CACHE_FAILURE_MS)) {
